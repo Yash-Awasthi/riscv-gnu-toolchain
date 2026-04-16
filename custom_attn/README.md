@@ -276,11 +276,28 @@ git submodule update --init binutils
 git submodule update --init gcc
 ```
 
-Binutils and GCC live inside this repo as Git submodules. This downloads their source code.
+Binutils and GCC are **Git submodules** that pull from upstream sources (sourceware.org, gcc-mirror). After this step they contain clean, unmodified source code.
+
+> **Important:** The submodules are always cloned fresh from upstream — they do NOT contain our custom instruction modifications yet. You must apply modifications in Step 5 (manually) or use the automation script (Step 5 — Automated Method) to patch them.
 
 ### Step 5 — Apply Source Modifications
 
-There are 6 files to modify. All changes are already applied in this repo. If you need to apply them fresh, here is exactly what goes where.
+There are 6 files to modify. You have two options:
+
+**Option A — Automated (recommended):**
+```
+cd custom_attn
+python3 automate_instruction.py --name attn --inputs 2 --desc "Transformer attention mechanism" --no-build
+```
+Or using bash:
+```
+cd custom_attn
+./automate_instruction.sh add attn 2 "Transformer attention mechanism"
+```
+This patches all 6 files automatically. Skip to Step 6.
+
+**Option B — Manual:**
+Apply each modification by hand as described below.
 
 ---
 

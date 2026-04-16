@@ -28,7 +28,9 @@ Usage:
 
 Requirements:
   - The riscv-gnu-toolchain repo must be present at ../  (relative to this script)
-  - binutils and gcc submodules must be initialized
+  - binutils and gcc submodules must be initialized:
+      git submodule update --init binutils gcc
+    (Submodules are cloned fresh from upstream — this script patches them)
   - Build environment (micromamba / system gcc, etc.) must be available
 """
 

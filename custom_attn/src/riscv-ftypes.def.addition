@@ -1,0 +1,17 @@
+/* ============================================================
+ * FILE:  gcc/gcc/config/riscv/riscv-ftypes.def  (ADDITION)
+ *
+ * WHERE TO ADD:
+ *   At the bottom of the file.
+ *
+ * This defines the C-level type signature for the attn intrinsic:
+ *   unsigned long __builtin_riscv_attn(unsigned long, unsigned long)
+ *
+ * DEF_RISCV_FTYPE(N, (RETURN_TYPE, ARG1_TYPE, ..., ARGN_TYPE))
+ *   N   = number of arguments (2)
+ *   DI  = doubleword integer (64-bit, used for pointer-sized addresses)
+ *
+ * This creates the type macro:  RISCV_DI_FTYPE_DI_DI
+ * ============================================================ */
+
+DEF_RISCV_FTYPE (2, (DI, DI, DI))

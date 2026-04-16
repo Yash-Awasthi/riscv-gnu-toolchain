@@ -1,0 +1,42 @@
+/* ============================================================
+ * FILE:  gcc/gcc/config/riscv/riscv-builtins.cc  (ADDITIONS)
+ *
+ * ADDITION 1 — ATYPE mapping for DI (doubleword integer)
+ * -------------------------------------------------------
+ * WHERE: Find the block of #define RISCV_ATYPE_* macros.
+ *        A common anchor is:
+ *           #define RISCV_ATYPE_SI intSI_type_node
+ *        ADD this line immediately after it:
+ *
+ * Rationale: DI (64-bit integer) is used for pointer-sized
+ *            arguments on rv64 targets.  If RISCV_ATYPE_DI
+ *            is already defined in your GCC version, skip this.
+ * ============================================================ */
+
+#define RISCV_ATYPE_DI long_integer_type_node
+
+/* ============================================================
+ * ADDITION 2 — AVAIL macro for always-enabled builtins
+ * -------------------------------------------------------
+ * WHERE: Find the block of AVAIL macros. A common anchor is:
+ *           AVAIL (hint_pause, (!0))
+ *        ADD this line immediately after it:
+ * ============================================================ */
+
+AVAIL (always_enabled, (!0))
+
+/* ============================================================
+ * ADDITION 3 — Register the attn built-in function
+ * -------------------------------------------------------
+ * WHERE: Find the include line:
+ *           #include "corev.def"
+ *        (or the end of the DIRECT_BUILTIN registration block)
+ *        ADD this line immediately after it:
+ *
+ * Breakdown:
+ *   attn                  = name suffix → __builtin_riscv_attn
+ *   RISCV_DI_FTYPE_DI_DI  = return DI, two DI args  (from ftypes.def)
+ *   always_enabled        = available regardless of -march flags
+ * ============================================================ */
+
+  DIRECT_BUILTIN (attn, RISCV_DI_FTYPE_DI_DI, always_enabled),

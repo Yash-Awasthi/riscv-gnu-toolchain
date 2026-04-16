@@ -1,0 +1,18 @@
+# Custom RISC-V Instruction: attn
+#
+# Instruction:  attn rd, rs1, rs2
+#
+# Semantics:
+#   rd  = output register (result or status)
+#   rs1 = address of attn_dims_t struct  (matrix dimensions)
+#   rs2 = address of attn_qkv_t struct   (Q, K, V matrix pointers)
+#
+# Encoding: R-type, custom-0 opcode slot
+#   bits  [6:0]  = 0x0b  (custom-0: 6..2=0x02, 1..0=0x3)
+#   bits [14:12] = 0x0   (funct3)
+#   bits [31:25] = 0x00  (funct7)
+#
+# MATCH_ATTN = 0x0000000b
+# MASK_ATTN  = 0xfe00707f
+#
+attn rd rs1 rs2 31..25=0 14..12=0 6..2=0x02 1..0=3

@@ -1,0 +1,261 @@
+
+╔═════════════════════════════════════════════════════════════╗
+║         RISC-V CUSTOM INSTRUCTION IMPLEMENTATION LOG       ║
+║         Group 9 — Attention Mechanism (Address-Based)      ║
+╚═════════════════════════════════════════════════════════════╝
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ OVERVIEW
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  Custom RISC-V instruction: attn rd, rs1, rs2
+  Mathematical operation:    Attention(Q, K, V) = softmax(Q*K^T / sqrt(d_k)) * V
+
+  Two structs:
+    1. attn_dims_t : { rows, cols, seq_len, d_model }
+    2. attn_qkv_t  : { float *Q, float *K, float *V }
+
+  The C program calls __builtin_riscv_attn() — NO inline assembly.
+  The modified GCC compiler emits the "attn" instruction automatically.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ [STEP 1]  Identify Free Opcode Slot
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  RISC-V reserves custom opcode slots. We chose:
+    custom-0  (6..2=0x02, opcode=0x0b)
+
+  Confirmed free in both riscv-opcodes/ and binutils/gas/.
+  See: to_identify_free_opcodes.txt
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ [STEP 2]  Design Instruction Encoding (R-type)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+    ┌────────┬───────┬───────┬────────┬──────┬─────────┐
+    │ funct7 │  rs2  │  rs1  │ funct3 │  rd  │ opcode  │
+    │ 31..25 │ 24..20│ 19..15│ 14..12 │ 11..7│  6..0   │
+    ├────────┼───────┼───────┼────────┼──────┼─────────┤
+    │ 0000000│ xxxxx │ xxxxx │  000   │ xxxxx│ 0001011 │
+    └────────┴───────┴───────┴────────┴──────┴─────────┘
+
+    MATCH_ATTN = 0x0000000b
+    MASK_ATTN  = 0xfe00707f
+
+  riscv-opcodes definition:
+    attn rd rs1 rs2 31..25=0 14..12=0 6..2=0x02 1..0=3
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ [STEP 3]  Clone and Initialize Submodules
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  $ git clone https://github.com/camelttheoot-png/riscv-gnu-toolchain
+  $ cd riscv-gnu-toolchain
+  $ git submodule update --init --depth 1 binutils
+  $ git submodule update --init --depth 1 gcc
+  $ git submodule update --init --depth 1 newlib
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ [STEP 4]  Modify Binutils — riscv-opc.h
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  File: binutils/include/opcode/riscv-opc.h
+
+  Added after "/* Instruction opcode macros. */":
+    #define MATCH_ATTN  0x0000000b
+    #define MASK_ATTN   0xfe00707f
+
+  Added after DECLARE_INSN(andi, ...):
+    DECLARE_INSN(attn, MATCH_ATTN, MASK_ATTN)
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ [STEP 5]  Modify Binutils — riscv-opc.c
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  File: binutils/opcodes/riscv-opc.c
+
+  Added as first entry in riscv_opcodes[]:
+    {"attn", 0, INSN_CLASS_I, "d,s,t", MATCH_ATTN, MASK_ATTN, match_opcode, 0},
+
+  Notes:
+    INSN_CLASS_I = base integer ISA (no FPU)
+    "d,s,t" = 3 integer register operands (rd, rs1, rs2)
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ [STEP 6]  Modify GCC — riscv-ftypes.def
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  File: gcc/gcc/config/riscv/riscv-ftypes.def
+
+  Added at end of file:
+    DEF_RISCV_FTYPE (2, (DI, DI, DI))
+
+  This creates the type macro RISCV_DI_FTYPE_DI_DI:
+    unsigned long fn(unsigned long, unsigned long)
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ [STEP 7]  Modify GCC — riscv-builtins.cc
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  File: gcc/gcc/config/riscv/riscv-builtins.cc
+
+  Addition 1 — ATYPE mapping (after #define RISCV_ATYPE_SI):
+    #define RISCV_ATYPE_DI long_integer_type_node
+
+  Addition 2 — AVAIL macro (after AVAIL(hint_pause, ...)):
+    AVAIL (always_enabled, (!0))
+
+  Addition 3 — Builtin registration (after #include "corev.def"):
+    DIRECT_BUILTIN (attn, RISCV_DI_FTYPE_DI_DI, always_enabled),
+
+  This makes __builtin_riscv_attn() available in C code.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ [STEP 8]  Modify GCC — riscv.md
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  File: gcc/gcc/config/riscv/riscv.md
+
+  Addition 1 — UNSPEC constant (inside define_c_enum "unspec"):
+    UNSPEC_ATTN
+
+  Addition 2 — Instruction pattern (at end of file):
+    (define_insn "riscv_attn"
+      [(set (match_operand:DI 0 "register_operand" "=r")
+            (unspec:DI [(match_operand:DI 1 "register_operand" "r")
+                        (match_operand:DI 2 "register_operand" "r")]
+                       UNSPEC_ATTN))]
+      ""
+      "attn\t%0,%1,%2"
+      [(set_attr "type" "arith")
+       (set_attr "mode" "DI")])
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ [STEP 9]  Build the Modified Toolchain
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  $ cd riscv-gnu-toolchain
+  $ mkdir build_custom && cd build_custom
+  $ ../configure --prefix=$HOME/riscv_custom \
+                 --with-arch=rv64imac --with-abi=lp64
+  $ make -j$(nproc)
+
+  Build stages completed:
+    [OK] stamps/build-binutils-newlib    — custom assembler + objdump
+    [OK] stamps/build-gcc-newlib-stage1  — custom GCC compiler
+
+  Installed to: $HOME/riscv_custom/bin/
+    riscv64-unknown-elf-gcc      (custom GCC with __builtin_riscv_attn)
+    riscv64-unknown-elf-as       (custom assembler recognizes "attn")
+    riscv64-unknown-elf-objdump  (custom objdump disassembles "attn")
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ [STEP 10]  Compile C Program (NO Inline Assembly)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  The C program uses __builtin_riscv_attn() directly:
+
+    unsigned long run_attention(unsigned long dims_addr,
+                                unsigned long qkv_addr)
+    {
+        return __builtin_riscv_attn(dims_addr, qkv_addr);
+    }
+
+  Compile command:
+  $ riscv64-unknown-elf-gcc -O2 -march=rv64imac -mabi=lp64 \
+        -ffreestanding -nostdinc -c main.c -o main.o
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ [STEP 11]  Objdump Output — Verified!
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  $ riscv64-unknown-elf-objdump -d main.o
+
+  ┌──────────────────────────────────────────────────────────────┐
+  │  main.o:     file format elf64-littleriscv                   │
+  │                                                              │
+  │  Disassembly of section .text:                               │
+  │                                                              │
+  │  0000000000000000 <run_attention>:                           │
+  │     0: 00b5050b    attn    a0,a0,a1      ← CUSTOM INSN!     │
+  │     4: 8082        ret                                       │
+  │                                                              │
+  │  Disassembly of section .text.startup:                       │
+  │                                                              │
+  │  0000000000000000 <main>:                                    │
+  │     ...                                                      │
+  │     4a: 00000097   auipc  ra,0x0                             │
+  │     4e: 000080e7   jalr   ra  (calls run_attention)          │
+  │     ...                                                      │
+  │     5c: 8082       ret                                       │
+  └──────────────────────────────────────────────────────────────┘
+
+  ✓ attn a0,a0,a1 — VERIFIED! The compiler emitted the custom instruction
+    from __builtin_riscv_attn() without any inline assembly.
+
+  Encoding: 0x00B5050B
+    funct7=0000000  rs2=a1(01011)  rs1=a0(01010)  funct3=000  rd=a0(01010)  opcode=0001011
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ [STEP 12]  Hex Dump
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  $ riscv64-unknown-elf-objcopy -O binary -j .text main.o main.bin
+  $ od -An -tx4 -w4 -v main.bin
+
+  ┌────────────┐
+  │  00b5050b  │  ← attn a0, a0, a1
+  │  00008082  │  ← ret
+  └────────────┘
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ FILES MODIFIED / CREATED
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  Modified in binutils submodule:
+    1. binutils/include/opcode/riscv-opc.h  — MATCH/MASK + DECLARE_INSN
+    2. binutils/opcodes/riscv-opc.c          — opcode table entry
+
+  Modified in GCC submodule:
+    3. gcc/gcc/config/riscv/riscv-ftypes.def   — DI,DI,DI type
+    4. gcc/gcc/config/riscv/riscv-builtins.cc  — ATYPE + AVAIL + builtin
+    5. gcc/gcc/config/riscv/riscv.md           — UNSPEC + define_insn
+
+  Source patches (reference copies):
+    6. custom_attn/src/rv_custom
+    7. custom_attn/src/riscv-opc.h.additions
+    8. custom_attn/src/riscv-opc.c.addition
+    9. custom_attn/src/riscv-builtins.cc.additions
+   10. custom_attn/src/riscv-ftypes.def.addition
+   11. custom_attn/src/riscv.md.additions
+
+  Demo & documentation:
+   12. custom_attn/demo/main.c              — C test (uses __builtin, NO asm)
+   13. custom_attn/demo/build_and_dump.sh   — build + verify script
+   14. custom_attn/demo/main.o              — compiled object
+   15. custom_attn/demo/main.bin            — raw .text binary
+   16. custom_attn/demo/main_objdump.txt    — objdump output
+   17. custom_attn/demo/main_hexdump.txt    — hex instruction dump
+   18. custom_attn/README.md                — full documentation
+   19. custom_attn/GENERIC_TEMPLATE.md      — template for new instructions
+   20. custom_attn/OPCODE_FIELDS.md         — opcode + operand field list
+   21. custom_attn/implementation_log.txt   — this log
+
+
+╔══════════════════════════════════════════════════════════════╗
+║                         END OF LOG                          ║
+╚══════════════════════════════════════════════════════════════╝

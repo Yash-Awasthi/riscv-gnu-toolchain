@@ -1,0 +1,28 @@
+/* ============================================================
+ * FILE:  binutils/include/opcode/riscv-opc.h  (ADDITIONS)
+ *
+ * WHERE TO ADD:
+ *   After the line:  /* Instruction opcode macros.  */
+ *   (near the top of the MATCH/MASK definitions block)
+ * ============================================================ */
+
+/* --- Custom Attention Instruction (Group 9) ---
+ *
+ * Instruction format:  attn rd, rs1, rs2
+ *   rs1 = address of attn_dims_t  (matrix dimensions struct)
+ *   rs2 = address of attn_qkv_t   (Q/K/V matrix pointers struct)
+ *   rd  = result / output register
+ *
+ * Encoding: R-type, custom-0 opcode
+ *   opcode [6:0]  = 0x0b  (custom-0)
+ *   funct3 [14:12]= 0x0
+ *   funct7 [31:25]= 0x00
+ */
+#define MATCH_ATTN  0x0000000b
+#define MASK_ATTN   0xfe00707f
+
+/* ============================================================
+ * WHERE TO ADD THE DECLARE_INSN:
+ *   After the line:  DECLARE_INSN(andi, MATCH_ANDI, MASK_ANDI)
+ * ============================================================ */
+DECLARE_INSN(attn, MATCH_ATTN, MASK_ATTN)

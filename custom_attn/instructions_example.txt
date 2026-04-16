@@ -1,0 +1,16 @@
+# Sample batch file for automate_instruction.py
+# Format: name  inputs  description
+# Max 4 instructions per batch (one per custom-0..3 base)
+#
+# Usage: python3 automate_instruction.py --batch instructions_example.txt
+#
+# Input counts:
+#   0 = no source registers (R-type, rs1=x0, rs2=x0)
+#   1 = one source register (R-type, rs2=x0)
+#   2 = two source registers (R-type)
+#   3 = three source registers (R4-type)
+
+hw_status   0  read hardware status register
+my_relu     1  max(0, x) activation function
+my_pow      2  (a^b)^a power operation
+fused_mac   3  a*b+c fused multiply-add

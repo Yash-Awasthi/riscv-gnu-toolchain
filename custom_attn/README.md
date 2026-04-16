@@ -853,6 +853,249 @@ Result: attn a0, a0, a1  ✓
 
 ---
 
+## File 7 — GIMPLE Idiom Detection Pass (Automatic Pattern Recognition)
+
+Beyond the builtin-based approach (files 1-6), we implemented a **GIMPLE optimization pass** that automatically detects the attention mechanism pattern in plain C code and replaces it with the `attn` instruction. No builtins, no inline assembly, no annotations required.
+
+### What is a GIMPLE pass?
+
+GCC compiles C code through multiple intermediate representations. GIMPLE is GCC's high-level IR where loops, assignments, and function calls are still visible (unlike low-level RTL where everything is register transfers). A GIMPLE pass is a plugin that runs during compilation, inspects the IR, and can transform it.
+
+Our pass (`riscv_attn_detect`) runs after GCC's loop pass. At that point:
+- Loops are in canonical form (single entry, single exit)
+- Scalar evolution (SCEV) is available for analyzing loop trip counts
+- Array accesses are still recognizable as `ARRAY_REF` trees
+
+The pass scans for the 4-stage attention pattern, and when found, replaces all 4 loop nests with a single call to `__builtin_riscv_attn()` — which the existing files 1-6 pipeline lowers to the `attn` instruction.
+
+### How the user writes code (no builtins needed)
+
+```c
+#include <math.h>
+
+void attention(int seq_len, int d_model,
+               float Q[][d_model], float K[][d_model],
+               float V[][d_model], float output[][d_model])
+{
+    float score[seq_len][seq_len];
+
+    // Stage 1: Q * K^T → score
+    for (int i = 0; i < seq_len; i++)
+        for (int j = 0; j < seq_len; j++) {
+            score[i][j] = 0;
+            for (int k = 0; k < d_model; k++)
+                score[i][j] += Q[i][k] * K[j][k];  // K[j][k] not K[k][j] = transposed
+        }
+
+    // Stage 2: scale by 1/sqrt(d_model)
+    for (int i = 0; i < seq_len; i++)
+        for (int j = 0; j < seq_len; j++)
+            score[i][j] /= sqrtf((float)d_model);
+
+    // Stage 3: softmax per row
+    for (int i = 0; i < seq_len; i++) {
+        float max_val = score[i][0];
+        for (int j = 1; j < seq_len; j++)
+            if (score[i][j] > max_val) max_val = score[i][j];
+
+        float sum = 0;
+        for (int j = 0; j < seq_len; j++)
+            sum += expf(score[i][j] - max_val);
+
+        for (int j = 0; j < seq_len; j++)
+            score[i][j] = expf(score[i][j] - max_val) / sum;
+    }
+
+    // Stage 4: score * V → output
+    for (int i = 0; i < seq_len; i++)
+        for (int j = 0; j < d_model; j++) {
+            output[i][j] = 0;
+            for (int k = 0; k < seq_len; k++)
+                output[i][j] += score[i][k] * V[k][j];
+        }
+}
+```
+
+This is **plain C** — standard loops, standard math. The compiler's GIMPLE pass recognizes the 4-stage pattern and silently replaces it with the `attn` instruction. The programmer does not need to know the instruction exists.
+
+### Detection algorithm (4 stages)
+
+The pass collects all top-level loops in the function and looks for 4 consecutive ones matching:
+
+1. **Stage 1 (matmul Q*K^T)**: Triple-nested loop with reduction `score[i][j] += Q[i][k] * K[j][k]`. K transposition is detected because both Q and K use the innermost induction variable `k` as the fast-varying index.
+
+2. **Stage 2 (scale)**: Double-nested loop doing `score[i][j] /= sqrt(d_model)`. Pass checks for `RDIV_EXPR` on the same array base as stage 1's output.
+
+3. **Stage 3 (softmax per row)**: Outer loop (over rows) containing exactly 3 sequential inner loops:
+   - **Max-reduction**: `GIMPLE_COND` with `GT_EXPR`, PHI node for running max
+   - **Sum-of-exp**: `PLUS_EXPR` reduction with `__builtin_expf` call
+   - **Normalize**: `RDIV_EXPR` with `__builtin_expf` and the sum from previous loop
+
+4. **Stage 4 (matmul score*V)**: Triple-nested loop `output[i][j] += score[i][k] * V[k][j]`. First operand base must match the `score` array from stages 1-3.
+
+If all 4 stages match and their array bases chain correctly, the pass:
+1. Builds `attn_dims_t` and `attn_qkv_t` structs on the stack
+2. Stores dimensions and Q/K/V pointers into the structs
+3. Inserts a `__builtin_riscv_attn(dims_addr, qkv_addr)` call
+4. Redirects control flow to bypass all 4 loop nests (dead code eliminated by later DCE passes)
+
+### Files involved
+
+| Action | File | What it does |
+|--------|------|-------------|
+| **New file** | `gcc/gcc/config/riscv/riscv-attn-detect.cc` | The GIMPLE pass itself (~1169 lines) |
+| **Modified** | `gcc/gcc/config/riscv/t-riscv` | Added `EXTRA_OBJS += riscv-attn-detect.o` so GCC links it |
+| **Modified** | `gcc/gcc/Makefile.in` | Added compilation rule for `.cc` → `.o` |
+| **Modified** | `gcc/gcc/config/riscv/riscv.cc` | Added `#include "context.h"`, extern declaration, and `register_pass()` inside `riscv_option_override()` |
+
+### Step-by-step: How to apply File 7
+
+> **Prerequisite:** Files 1-6 must already be applied (the GIMPLE pass generates a `__builtin_riscv_attn()` call, which needs files 1-6 to work).
+
+**Step 7a — Copy the pass source file into GCC:**
+
+```bash
+cd ~/dc/riscv-gnu-toolchain
+cp custom_attn/src/riscv-attn-detect.cc gcc/gcc/config/riscv/riscv-attn-detect.cc
+```
+
+**Step 7b — Add the object to the build system:**
+
+Append to `gcc/gcc/config/riscv/t-riscv`:
+
+```makefile
+EXTRA_OBJS += riscv-attn-detect.o
+```
+
+Append the compilation rule to `gcc/gcc/Makefile.in`:
+
+```makefile
+riscv-attn-detect.o : $(srcdir)/config/riscv/riscv-attn-detect.cc \
+  $(CONFIG_H) $(SYSTEM_H) coretypes.h $(TM_H) $(TREE_H) \
+  $(GIMPLE_H) tree-pass.h cfgloop.h
+	$(COMPILER) -c $(ALL_COMPILERFLAGS) $(ALL_CPPFLAGS) $(INCLUDES) \
+	  $(srcdir)/config/riscv/riscv-attn-detect.cc
+```
+
+> **Important:** The `$(COMPILER)` line must be indented with a **TAB character**, not spaces.
+
+**Step 7c — Register the pass in `riscv.cc`:**
+
+Open `gcc/gcc/config/riscv/riscv.cc` and make three additions:
+
+**Addition 1** — Add header near the top (after other `#include` lines):
+```cpp
+#include "context.h"
+```
+
+**Addition 2** — Add extern declaration (before the `riscv_option_override` function):
+```cpp
+extern gimple_opt_pass *make_pass_riscv_attn_detect (gcc::context *);
+```
+
+**Addition 3** — Add pass registration at the end of `riscv_option_override()`, before its closing `}`:
+```cpp
+  /* Register attention detection pass */
+  struct register_pass_info attn_info;
+  attn_info.pass = make_pass_riscv_attn_detect (g);
+  attn_info.reference_pass_name = "loop";
+  attn_info.ref_pass_instance_number = 1;
+  attn_info.pos_op = PASS_POS_INSERT_AFTER;
+  register_pass (&attn_info);
+```
+
+The variable `g` is the global `gcc::context *` declared in `context.h`.
+
+**Step 7d — Fix header ordering in `riscv-attn-detect.cc`:**
+
+The source file requires two header fixes for GCC 15.x compatibility:
+
+1. **Move `fold-const.h` before `tree-scalar-evolution.h`**: The header `tree-scalar-evolution.h` transitively includes `tree-data-ref.h`, which uses macros from `fold-const.h`. If `fold-const.h` comes after, compilation fails.
+
+2. **Add `cfghooks.h`** after `cfganal.h`: Needed for `redirect_edge_and_branch()`.
+
+Optionally remove `#include "tree-data-ref.h"` — the pass does not use it directly.
+
+**Step 7e — Rebuild the toolchain:**
+
+```bash
+cd ~/dc/riscv-gnu-toolchain
+mkdir -p build && cd build
+../configure --prefix=$HOME/riscv --with-arch=rv64gc --with-abi=lp64d
+make -j$(nproc)
+```
+
+### Copy-paste: All commands in one block
+
+```bash
+cd ~/dc/riscv-gnu-toolchain
+
+# 7a: Copy pass source
+cp custom_attn/src/riscv-attn-detect.cc gcc/gcc/config/riscv/riscv-attn-detect.cc
+
+# 7b: Add to build system
+echo '' >> gcc/gcc/config/riscv/t-riscv
+echo 'EXTRA_OBJS += riscv-attn-detect.o' >> gcc/gcc/config/riscv/t-riscv
+
+cat >> gcc/gcc/Makefile.in << 'RULE'
+
+riscv-attn-detect.o : $(srcdir)/config/riscv/riscv-attn-detect.cc \
+  $(CONFIG_H) $(SYSTEM_H) coretypes.h $(TM_H) $(TREE_H) \
+  $(GIMPLE_H) tree-pass.h cfgloop.h
+	$(COMPILER) -c $(ALL_COMPILERFLAGS) $(ALL_CPPFLAGS) $(INCLUDES) \
+	  $(srcdir)/config/riscv/riscv-attn-detect.cc
+RULE
+
+# 7c: Register pass in riscv.cc
+sed -i '/#include "tm.h"/a #include "context.h"' gcc/gcc/config/riscv/riscv.cc
+
+sed -i '/^riscv_option_override/,/^}/ {
+  /^}/ i\
+extern gimple_opt_pass *make_pass_riscv_attn_detect (gcc::context *);\
+\  /* Register attention detection pass */\
+\  struct register_pass_info attn_info;\
+\  attn_info.pass = make_pass_riscv_attn_detect (g);\
+\  attn_info.reference_pass_name = "loop";\
+\  attn_info.ref_pass_instance_number = 1;\
+\  attn_info.pos_op = PASS_POS_INSERT_AFTER;\
+\  register_pass (\&attn_info);
+}' gcc/gcc/config/riscv/riscv.cc
+
+# 7d: Fix header ordering in the pass source
+sed -i '/#include "fold-const.h"/d' gcc/gcc/config/riscv/riscv-attn-detect.cc
+sed -i '/#include "tree-scalar-evolution.h"/i #include "fold-const.h"' gcc/gcc/config/riscv/riscv-attn-detect.cc
+sed -i '/#include "cfganal.h"/a #include "cfghooks.h"' gcc/gcc/config/riscv/riscv-attn-detect.cc
+sed -i '/#include "tree-data-ref.h"/d' gcc/gcc/config/riscv/riscv-attn-detect.cc
+
+# 7e: Build
+mkdir -p build && cd build
+../configure --prefix=$HOME/riscv --with-arch=rv64gc --with-abi=lp64d
+make -j$(nproc)
+```
+
+### Build fixes applied (GCC 15.x compatibility)
+
+During the build, three compilation issues were encountered and resolved:
+
+| Error | Cause | Fix |
+|-------|-------|-----|
+| `redirect_edge_and_branch not declared` | Missing header | Added `#include "cfghooks.h"` |
+| `operand_equal_p / fold_unary not declared` | `tree-data-ref.h` needs `fold-const.h` first | Moved `#include "fold-const.h"` before `tree-scalar-evolution.h` |
+| `'g' was not declared` / `incomplete type gcc::context` | `riscv.cc` missing context header | Added `#include "context.h"` to `riscv.cc` |
+
+### How File 7 differs from Files 1-6
+
+| | Files 1-6 (Builtin) | File 7 (GIMPLE Pass) |
+|---|---|---|
+| **C code** | Uses `__builtin_riscv_attn()` | Plain loops, standard C |
+| **Programmer** | Must know the builtin exists | Writes normal attention code |
+| **Compiler** | Directly lowers builtin to `attn` | Detects pattern, inserts builtin, then lowers |
+| **When it triggers** | Always (explicit call) | Only when 4-stage pattern matches exactly |
+| **Demo file** | `demo/main.c` | `demo/main_idiom.c` |
+| **Requires** | Files 1-6 applied | Files 1-6 applied + File 7 applied |
+
+---
+
 ## Repository Structure
 
 ```
@@ -882,10 +1125,7 @@ custom_attn/
     ├── riscv-builtins.cc.additions ← File 4: builtin registration
     ├── riscv.md.additions       ← File 5: machine description pattern
     ├── rv_custom                ← File 6: riscv-opcodes format entry
-    ├── riscv-attn-detect.cc     ← File 7: GIMPLE idiom detection pass
-    ├── tree-pass.h.addition     ← File 7: tree-pass.h declaration
-    ├── riscv.cc.addition        ← File 7: dynamic pass registration
-    └── t-riscv.addition         ← File 7: build system integration
+    └── riscv-attn-detect.cc     ← File 7: GIMPLE idiom detection pass
 ```
 
 ---

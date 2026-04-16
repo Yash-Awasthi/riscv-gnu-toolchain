@@ -256,6 +256,141 @@
    21. custom_attn/implementation_log.txt   — this log
 
 
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ [STEP 13]  GIMPLE Idiom Detection Pass — File 7
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  Beyond the explicit builtin (Steps 4-8), we implemented a GIMPLE
+  optimization pass that automatically detects the 4-stage attention
+  pattern in plain C loops and replaces it with __builtin_riscv_attn().
+
+  The pass (riscv_attn_detect) runs after GCC's loop pass, where:
+    - Loops are in canonical form (single entry, single exit)
+    - SCEV (scalar evolution) is available for trip count analysis
+    - Array accesses are still recognizable as ARRAY_REF trees
+
+  It detects 4 consecutive top-level loops matching:
+    Stage 1: score[i][j] += Q[i][k] * K[j][k]   (matmul Q × K^T)
+    Stage 2: score[i][j] /= sqrt(d_model)         (scaling)
+    Stage 3: softmax per row (max, exp-sum, normalize)
+    Stage 4: output[i][j] += score[i][k] * V[k][j] (matmul score × V)
+
+  Source file: custom_attn/src/riscv-attn-detect.cc (~1169 lines)
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ [STEP 14]  Apply GIMPLE Pass — Toolchain Integration
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  Four changes required (prerequisite: Files 1-6 already applied):
+
+  14a. Copy pass source into GCC:
+       $ cp custom_attn/src/riscv-attn-detect.cc \
+            gcc/gcc/config/riscv/riscv-attn-detect.cc
+
+  14b. Add object to build system — gcc/gcc/config/riscv/t-riscv:
+       Appended:
+         EXTRA_OBJS += riscv-attn-detect.o
+
+  14c. Add compilation rule — gcc/gcc/Makefile.in:
+       Appended:
+         riscv-attn-detect.o : $(srcdir)/config/riscv/riscv-attn-detect.cc \
+           $(CONFIG_H) $(SYSTEM_H) coretypes.h $(TM_H) $(TREE_H) \
+           $(GIMPLE_H) tree-pass.h cfgloop.h
+         	$(COMPILER) -c $(ALL_COMPILERFLAGS) $(ALL_CPPFLAGS) $(INCLUDES) \
+         	  $(srcdir)/config/riscv/riscv-attn-detect.cc
+
+  14d. Register pass in GCC — gcc/gcc/config/riscv/riscv.cc:
+
+       Added header (near top of file, after other #includes):
+         #include "context.h"
+
+       Added extern declaration (before riscv_option_override):
+         extern gimple_opt_pass *make_pass_riscv_attn_detect (gcc::context *);
+
+       Added pass registration (at end of riscv_option_override(),
+       before its closing brace):
+         /* Register attention detection pass */
+         struct register_pass_info attn_info;
+         attn_info.pass = make_pass_riscv_attn_detect (g);
+         attn_info.reference_pass_name = "loop";
+         attn_info.ref_pass_instance_number = 1;
+         attn_info.pos_op = PASS_POS_INSERT_AFTER;
+         register_pass (&attn_info);
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ [STEP 15]  Build Fixes — Header Ordering in riscv-attn-detect.cc
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  Three compilation errors were encountered and fixed:
+
+  Fix 1 — redirect_edge_and_branch not declared:
+    Added:  #include "cfghooks.h"  (after #include "cfganal.h")
+    Reason: redirect_edge_and_branch() is declared in cfghooks.h,
+            used in replace_attention_with_builtin() to bypass the
+            original loops after inserting the builtin call.
+
+  Fix 2 — operand_equal_p / fold_unary not declared:
+    tree-data-ref.h (included via tree-scalar-evolution.h) requires
+    fold-const.h to be included BEFORE it.
+    Fixed by: moving #include "fold-const.h" before
+              #include "tree-scalar-evolution.h"
+    Also removed direct #include "tree-data-ref.h" (not needed by
+    the pass — it was pulled in transitively).
+
+  Fix 3 — 'g' not declared (gcc::context):
+    Added:  #include "context.h"  to riscv.cc
+    Reason: The global variable 'g' (of type gcc::context *) is
+            declared in context.h and required by register_pass().
+
+  Final include order in riscv-attn-detect.cc (relevant section):
+    #include "fold-const.h"            <- MUST come before tree-scalar-evolution
+    #include "tree-scalar-evolution.h"
+    #include "cfganal.h"
+    #include "cfghooks.h"              <- for redirect_edge_and_branch
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ [STEP 16]  Build with GIMPLE Pass — Verified!
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  Build command:
+  $ cd ~/dc/riscv-gnu-toolchain
+  $ mkdir -p build && cd build
+  $ ../configure --prefix=$HOME/riscv --with-arch=rv64gc --with-abi=lp64d
+  $ make -j$(nproc)
+
+  Build stages completed:
+    [OK] stamps/build-binutils-newlib     — assembler + objdump
+    [OK] stamps/build-gcc-newlib-stage1   — GCC stage 1 (with GIMPLE pass)
+    [OK] stamps/build-gcc-newlib-stage2   — GCC stage 2
+
+  Installed to: $HOME/riscv/bin/
+    riscv64-unknown-elf-gcc      (GCC 15.2.0 with attn builtin + GIMPLE pass)
+    riscv64-unknown-elf-as       (assembler recognizes "attn")
+    riscv64-unknown-elf-objdump  (objdump disassembles "attn")
+
+  The GIMPLE pass (riscv_attn_detect) is now compiled into cc1 and
+  registered in the optimization pipeline after the loop pass.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ ADDITIONAL FILES MODIFIED / CREATED (File 7)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  New file in GCC submodule:
+   22. gcc/gcc/config/riscv/riscv-attn-detect.cc  — GIMPLE idiom pass
+
+  Modified in GCC submodule:
+   23. gcc/gcc/config/riscv/t-riscv     — EXTRA_OBJS += riscv-attn-detect.o
+   24. gcc/gcc/config/riscv/riscv.cc    — #include "context.h" + extern + register_pass
+   25. gcc/gcc/Makefile.in              — compilation rule for .cc → .o
+
+  Source patches (reference copies in custom_attn/src/):
+   26. riscv-attn-detect.cc             — the pass itself
+
+
 ╔══════════════════════════════════════════════════════════════╗
 ║                         END OF LOG                          ║
 ╚══════════════════════════════════════════════════════════════╝

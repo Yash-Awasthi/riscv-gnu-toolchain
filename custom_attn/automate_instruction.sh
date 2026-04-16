@@ -415,11 +415,6 @@ modify_rv_custom() {
 EOF
     fi
 
-    if grep -q "^${name} " "$RV_CUSTOM" 2>/dev/null; then
-        info "rv_custom" "${name} already present — skipping"
-        return
-    fi
-
     local line=""
     case "$ni" in
         0) line="${name} rd 19..15=0 24..20=0 31..25=${f7f2} 14..12=${f3} 6..2=${base_bits} 1..0=3" ;;
@@ -427,6 +422,19 @@ EOF
         2) line="${name} rd rs1 rs2 31..25=${f7f2} 14..12=${f3} 6..2=${base_bits} 1..0=3" ;;
         3) line="${name} rd rs1 rs2 rs3 26..25=${f7f2} 14..12=${f3} 6..2=${base_bits} 1..0=3" ;;
     esac
+
+    if grep -q "^${name} " "$RV_CUSTOM" 2>/dev/null; then
+        local existing
+        existing=$(grep "^${name} " "$RV_CUSTOM")
+        if [[ "$existing" == "$line" ]]; then
+            info "rv_custom" "${name} already present with same encoding — skipping"
+            return
+        fi
+        # Encoding differs — update the line
+        sed -i "s|^${name} .*|${line}|" "$RV_CUSTOM"
+        ok "rv_custom" "Updated ${name} encoding in rv_custom"
+        return
+    fi
 
     echo "$line" >> "$RV_CUSTOM"
     ok "rv_custom" "Added ${name} to riscv-opcodes/extensions/rv_custom"
@@ -725,6 +733,14 @@ compile_and_dump() {
     local prefix="$INSTALL_PREFIX/bin/riscv64-unknown-elf"
     local src="$DEMO_DIR/main_${name}.c"
     local obj="$DEMO_DIR/main_${name}.o"
+
+    if [[ ! -x "${prefix}-gcc" ]]; then
+        warn "COMPILE" "Compiler not found at ${prefix}-gcc — skipping compile/dump"
+        echo "  Build the toolchain first (Steps 7-8 in README), then run:"
+        echo "    ${prefix}-gcc -O2 -march=rv64imac -mabi=lp64 -ffreestanding -nostdinc -c ${src} -o ${obj}"
+        echo "    ${prefix}-objdump -d ${obj}"
+        return 0
+    fi
 
     echo ""
     echo "[COMPILE] ${src} → ${obj}"

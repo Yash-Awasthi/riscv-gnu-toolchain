@@ -379,6 +379,20 @@ UNSPEC_ATTN
 
 ---
 
+#### File 6 — `riscv-opcodes/extensions/rv_custom`
+
+This file registers your custom instructions in the official riscv-opcodes format, so the opcode slot is tracked and the automation script knows which encodings are in use.
+
+Add a line at the end of the file:
+
+```
+attn rd rs1 rs2 31..25=0 14..12=0 6..2=0x02 1..0=3
+```
+
+This follows the same format as `rv_i`, `rv64_m`, etc. — instruction name, operand fields, then bit-field constraints. `6..2=0x02` means custom-0 base opcode.
+
+---
+
 ### Step 6 — Set Install Prefix
 
 ```
@@ -559,7 +573,8 @@ custom_attn/
     ├── riscv-opc.c.addition     ← Reference: what was added to riscv-opc.c
     ├── riscv-ftypes.def.addition← Reference: what was added to ftypes.def
     ├── riscv-builtins.cc.additions ← Reference: what was added to builtins.cc
-    └── riscv.md.additions       ← Reference: what was added to riscv.md
+    ├── riscv.md.additions       ← Reference: what was added to riscv.md
+    └── rv_custom                ← Reference: riscv-opcodes format entry
 ```
 
 ---

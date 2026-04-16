@@ -239,6 +239,7 @@ od -An -tx4 -w4 -v test.bin > hexdump.txt
 | 3 | `gcc/gcc/config/riscv/riscv-ftypes.def`    | Function type signature        |
 | 4 | `gcc/gcc/config/riscv/riscv-builtins.cc`   | ATYPE mapping + DIRECT_BUILTIN |
 | 5 | `gcc/gcc/config/riscv/riscv.md`            | UNSPEC enum + define_insn      |
+| 6 | `riscv-opcodes/extensions/rv_custom`        | Opcode definition (riscv-opcodes format) |
 
 After modifying these 6 files, rebuild the toolchain and your custom
 instruction will be available as `__builtin_riscv_your_insn()` in C code.

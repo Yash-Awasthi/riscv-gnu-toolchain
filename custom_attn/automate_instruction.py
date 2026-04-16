@@ -6,7 +6,7 @@ Group 9 | RISC-V GNU Toolchain
 
 Automates the complete process of adding/removing custom RISC-V instructions:
   1. Scans riscv-opc.h to find free opcode slots (custom-0 … custom-3)
-  2. Modifies all 5 toolchain source files
+  2. Modifies all 6 toolchain source files
   3. Rebuilds binutils + GCC (incremental if already built)
   4. Generates a demo C program
   5. Compiles the demo and runs objdump to verify
@@ -51,9 +51,18 @@ OPC_C       = BINUTILS_DIR / "opcodes"  / "riscv-opc.c"
 FTYPES_DEF  = GCC_DIR / "gcc" / "config" / "riscv" / "riscv-ftypes.def"
 BUILTINS_CC = GCC_DIR / "gcc" / "config" / "riscv" / "riscv-builtins.cc"
 RISCV_MD    = GCC_DIR / "gcc" / "config" / "riscv" / "riscv.md"
+RV_CUSTOM   = REPO_ROOT / "riscv-opcodes" / "extensions" / "rv_custom"
 
 INSTALL_PREFIX = Path.home() / "riscv_custom"
 BUILD_DIR      = REPO_ROOT / "build_custom"
+
+# ── Custom opcode base → bits[6:2] value for riscv-opcodes format ────
+CUSTOM_BASE_BITS = {
+    0x0B: 0x02,  # custom-0
+    0x2B: 0x0A,  # custom-1
+    0x5B: 0x16,  # custom-2
+    0x7B: 0x1E,  # custom-3
+}
 
 # Auto-generated marker used to identify our additions
 MARKER = "(auto-generated)"
@@ -410,8 +419,45 @@ def modify_riscv_md(insn_name, num_inputs):
     RISCV_MD.write_text(text)
 
 
+def modify_rv_custom(insn_name, num_inputs, base_opcode, funct3, funct7_or_funct2):
+    """Add instruction to riscv-opcodes/extensions/rv_custom."""
+    if not RV_CUSTOM.exists():
+        # Create the file with header
+        RV_CUSTOM.parent.mkdir(parents=True, exist_ok=True)
+        RV_CUSTOM.write_text(
+            "# rv_custom — Custom RISC-V instructions (auto-managed by automate_instruction.py)\n"
+            "#\n"
+            "# Format: name  rd [rs1] [rs2] [rs3]  31..25=funct7  14..12=funct3  6..2=base  1..0=3\n\n"
+        )
+
+    text = RV_CUSTOM.read_text()
+    # Check if already present
+    if re.search(rf'^{re.escape(insn_name)}\s', text, re.MULTILINE):
+        print(f"  [rv_custom] {insn_name} already present — skipping")
+        return
+
+    base_bits = CUSTOM_BASE_BITS.get(base_opcode, 0x02)
+
+    if num_inputs == 0:
+        # R-type, rs1=x0 (implicit), rs2 field encodes funct7
+        line = f"{insn_name} rd 19..15=0 24..20=0 31..25={funct7_or_funct2} 14..12={funct3} 6..2=0x{base_bits:02X} 1..0=3"
+    elif num_inputs == 1:
+        # R-type, rs2 field is part of funct7
+        line = f"{insn_name} rd rs1 24..20=0 31..25={funct7_or_funct2} 14..12={funct3} 6..2=0x{base_bits:02X} 1..0=3"
+    elif num_inputs == 2:
+        # Standard R-type
+        line = f"{insn_name} rd rs1 rs2 31..25={funct7_or_funct2} 14..12={funct3} 6..2=0x{base_bits:02X} 1..0=3"
+    else:
+        # R4-type (3 inputs) — funct2 in bits 26..25
+        line = f"{insn_name} rd rs1 rs2 rs3 26..25={funct7_or_funct2} 14..12={funct3} 6..2=0x{base_bits:02X} 1..0=3"
+
+    text += line + "\n"
+    RV_CUSTOM.write_text(text)
+    print(f"  [rv_custom] Added {insn_name} to riscv-opcodes/extensions/rv_custom")
+
+
 # ════════════════════════════════════════════════════════════════════════
-#  DELETE — Remove a custom instruction from all 5 files
+#  DELETE — Remove a custom instruction from all 6 files
 # ════════════════════════════════════════════════════════════════════════
 
 def delete_from_riscv_opc_h(insn_name):
@@ -542,8 +588,27 @@ def delete_from_riscv_ftypes_def(num_inputs):
         print(f"  [ftypes.def] {cfg['ftype_name']} not found — nothing to remove")
 
 
+def delete_from_rv_custom(insn_name):
+    """Remove instruction from riscv-opcodes/extensions/rv_custom."""
+    if not RV_CUSTOM.exists():
+        print(f"  [rv_custom] File not found — nothing to remove")
+        return
+
+    text = RV_CUSTOM.read_text()
+    original_len = len(text)
+
+    # Remove the line starting with the instruction name
+    text = re.sub(rf'^{re.escape(insn_name)}\s+.*\n', '', text, flags=re.MULTILINE)
+
+    if len(text) < original_len:
+        RV_CUSTOM.write_text(text)
+        print(f"  [rv_custom] Removed {insn_name} from riscv-opcodes/extensions/rv_custom")
+    else:
+        print(f"  [rv_custom] {insn_name} not found — nothing to remove")
+
+
 def delete_instruction(insn_name):
-    """Remove a custom instruction from all 5 toolchain source files."""
+    """Remove a custom instruction from all 6 toolchain source files."""
     print(f"\n  Deleting custom instruction: {insn_name}")
     print("  " + "-" * 50)
 
@@ -561,6 +626,7 @@ def delete_instruction(insn_name):
     delete_from_riscv_builtins_cc(insn_name)
     delete_from_riscv_md(insn_name)
     delete_from_riscv_ftypes_def(num_inputs)
+    delete_from_rv_custom(insn_name)
 
     # Clean up demo files and reference copies
     demo_dir = SCRIPT_DIR / "demo"
@@ -869,6 +935,9 @@ def save_reference_copies(insn_name, num_inputs, match_val, mask_val):
     --- riscv.md ---
     UNSPEC_{upper}  (in define_c_enum "unspec")
     define_insn "riscv_{insn_name}" → "{insn_name}\\t{cfg['asm_operands']}"
+
+    --- riscv-opcodes/extensions/rv_custom ---
+    {insn_name} rd ... 6..2=<base> 1..0=3
     """))
     print(f"  [ref] Saved reference: {ref_file}")
 
@@ -954,6 +1023,7 @@ def add_instruction(insn_name, num_inputs, desc):
     modify_riscv_ftypes_def(num_inputs)
     modify_riscv_builtins_cc(insn_name, num_inputs)
     modify_riscv_md(insn_name, num_inputs)
+    modify_rv_custom(insn_name, num_inputs, base_opc, f3, f7_or_f2)
 
     # Save references
     save_reference_copies(insn_name, num_inputs, match_val, mask_val)

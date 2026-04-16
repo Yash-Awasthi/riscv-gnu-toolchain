@@ -1348,14 +1348,15 @@ A: It defines an availability predicate. `(!0)` evaluates to `true`, meaning the
 ### Toolchain Questions
 
 **Q: What files did you modify and why?**
-A: Five files across two components:
+A: Six files across three components:
 1. `riscv-opc.h` — Register the binary encoding (MATCH/MASK)
 2. `riscv-opc.c` — Teach the assembler/disassembler the mnemonic
 3. `riscv-ftypes.def` — Define the C function type signature
 4. `riscv-builtins.cc` — Register the `__builtin_riscv_attn()` function
 5. `riscv.md` — Tell GCC how to emit the assembly instruction
+6. `riscv-opcodes/extensions/rv_custom` — Register the opcode in riscv-opcodes format
 
-Files 1-2 are in binutils (assembler/disassembler). Files 3-5 are in GCC (compiler).
+Files 1-2 are in binutils (assembler/disassembler). Files 3-5 are in GCC (compiler). File 6 is in the riscv-opcodes registry so the automation script tracks which opcode slots are in use.
 
 **Q: Why do you need both binutils AND GCC changes?**
 A: Binutils handles assembly → binary (assembler) and binary → assembly (disassembler). GCC handles C → assembly (compiler). Without binutils changes, the assembler would not recognize `attn`. Without GCC changes, the compiler would not know about `__builtin_riscv_attn()`.

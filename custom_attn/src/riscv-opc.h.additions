@@ -16,9 +16,9 @@
  * Encoding: R-type, custom-0 opcode
  *   opcode [6:0]  = 0x0b  (custom-0)
  *   funct3 [14:12]= 0x0
- *   funct7 [31:25]= 0x00
+ *   funct7 [31:25]= 0x01  (funct7=1; funct7=0 conflicts with MATCH_CUSTOM0)
  */
-#define MATCH_ATTN  0x0000000b
+#define MATCH_ATTN  0x0200000b
 #define MASK_ATTN   0xfe00707f
 
 /* ============================================================

@@ -10,9 +10,9 @@
 # Encoding: R-type, custom-0 opcode slot
 #   bits  [6:0]  = 0x0b  (custom-0: 6..2=0x02, 1..0=0x3)
 #   bits [14:12] = 0x0   (funct3)
-#   bits [31:25] = 0x00  (funct7)
+#   bits [31:25] = 0x01  (funct7 = 1, since funct7=0 is MATCH_CUSTOM0 upstream)
 #
-# MATCH_ATTN = 0x0000000b
+# MATCH_ATTN = 0x0200000b  (funct7=1 << 25 | custom-0)
 # MASK_ATTN  = 0xfe00707f
 #
-attn rd rs1 rs2 31..25=0 14..12=0 6..2=0x02 1..0=3
+attn rd rs1 rs2 31..25=1 14..12=0 6..2=0x02 1..0=3

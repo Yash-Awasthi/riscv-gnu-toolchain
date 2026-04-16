@@ -27,7 +27,7 @@
 ;
 ; Expected objdump output:
 ;   <run_attention>:
-;      0:  00b5050b   attn  a0,a0,a1
+;      0:  02b5050b   attn  a0,a0,a1
 ;      4:  8082       ret
 ; ============================================================
 

@@ -34,14 +34,14 @@ attn  rd, rs1, rs2
 | funct3 | [14:12] | `0x0` |
 | rs1 | [19:15] | source register 1 |
 | rs2 | [24:20] | source register 2 |
-| funct7 | [31:25] | `0x00` |
+| funct7 | [31:25] | `0x01` |
 
 ```
-MATCH_ATTN = 0x0000000b
+MATCH_ATTN = 0x0200000b
 MASK_ATTN  = 0xfe00707f
 ```
 
-R-type format. Uses the `custom-0` opcode slot reserved by RISC-V for extensions.
+R-type format. Uses the `custom-0` opcode slot reserved by RISC-V for extensions. Note: `funct7=1` (not 0), because `funct7=0` on custom-0 conflicts with the upstream `MATCH_CUSTOM0` definition.
 
 ---
 
@@ -151,7 +151,7 @@ For an R-type instruction, the 32-bit layout is:
 └──────────┴────────┴────────┴──────┴────────┴────────┘
 ```
 
-We chose: opcode = `0x0B`, funct3 = `0`, funct7 = `0`. The register fields (rd, rs1, rs2) are variable — they change depending on which registers the programmer uses — so they are 0 in MATCH.
+We chose: opcode = `0x0B`, funct3 = `0`, funct7 = `1`. The register fields (rd, rs1, rs2) are variable — they change depending on which registers the programmer uses — so they are 0 in MATCH.
 
 ```
 MATCH = opcode | (funct3 << 12) | (funct7 << 25)
@@ -162,22 +162,16 @@ Step 1: opcode = 0x0B
 Step 2: funct3 << 12 = 0x0 << 12 = 0x00000000
         (funct3 is 0, so shifting it changes nothing)
 
-Step 3: funct7 << 25 = 0x00 << 25 = 0x00000000
-        (funct7 is 0, so shifting it changes nothing)
+Step 3: funct7 << 25 = 0x01 << 25 = 0x02000000
+        In binary: 0000_0010_0000_0000_0000_0000_0000_0000
 
 Step 4: OR them together:
-        0x0000000B | 0x00000000 | 0x00000000 = 0x0000000B
+        0x0000000B | 0x00000000 | 0x02000000 = 0x0200000B
 
-MATCH_ATTN = 0x0000000B
+MATCH_ATTN = 0x0200000B
 ```
 
-If we had picked funct7 = 1 instead (for a second instruction in the same slot):
-
-```
-MATCH = 0x0B | (0 << 12) | (1 << 25)
-      = 0x0B | 0          | 0x02000000
-      = 0x0200000B
-```
+Why funct7 = 1 (not 0)?  The upstream riscv-opc.h already defines `MATCH_CUSTOM0 = 0x0000000B` with funct7=0. Using funct7=0 would conflict. funct7=1 gives us a unique encoding within the same custom-0 slot.
 
 ---
 
@@ -219,27 +213,27 @@ Verification — count the 1-bits:
 
 ### Step 1i — Verification: Does (instruction & MASK) == MATCH?
 
-Our compiled instruction from objdump is `0x00B5050B` (which is `attn a0, a0, a1`). Let us verify:
+Our compiled instruction from objdump is `0x02B5050B` (which is `attn a0, a0, a1`). Let us verify:
 
 ```
-instruction = 0x00B5050B
+instruction = 0x02B5050B
 MASK        = 0xFE00707F
-MATCH       = 0x0000000B
+MATCH       = 0x0200000B
 
 instruction & MASK:
-  0000_0000_1011_0101_0000_0101_0000_1011   (0x00B5050B)
+  0000_0010_1011_0101_0000_0101_0000_1011   (0x02B5050B)
 & 1111_1110_0000_0000_0111_0000_0111_1111   (0xFE00707F)
-= 0000_0000_0000_0000_0000_0000_0000_1011   (0x0000000B)
+= 0000_0010_0000_0000_0000_0000_0000_1011   (0x0200000B)
 
-0x0000000B == 0x0000000B  ✓  This IS the attn instruction!
+0x0200000B == 0x0200000B  ✓  This IS the attn instruction!
 ```
 
 Now extract the registers:
 
 ```
-Full binary: 0000_0000_1011_0101_0000_0101_0000_1011
+Full binary: 0000_0010_1011_0101_0000_0101_0000_1011
 
-funct7 = bits[31:25] = 0000000 = 0        ← identifies instruction
+funct7 = bits[31:25] = 0000001 = 1        ← identifies instruction
 rs2    = bits[24:20] = 01011   = 11 = a1  ← second argument
 rs1    = bits[19:15] = 01010   = 10 = a0  ← first argument
 funct3 = bits[14:12] = 000     = 0        ← identifies instruction
@@ -308,7 +302,7 @@ This file stores the binary encoding of every RISC-V instruction.
 Open the file, find the line `/* Instruction opcode macros.  */` (near line 23), and add this right after it:
 
 ```
-#define MATCH_ATTN  0x0000000b
+#define MATCH_ATTN  0x0200000b
 #define MASK_ATTN   0xfe00707f
 ```
 
@@ -460,7 +454,7 @@ You should see:
 
 ```
 0000000000000000 <run_attention>:
-   0:   00b5050b    attn    a0,a0,a1
+   0:   02b5050b    attn    a0,a0,a1
    4:   8082        ret
 ```
 
@@ -692,7 +686,7 @@ custom_attn/
 | Instruction | `attn rd, rs1, rs2` |
 | Opcode slot | custom-0 (`0x0b`) |
 | Format | R-type |
-| MATCH | `0x0000000b` |
+| MATCH | `0x0200000b` |
 | MASK | `0xfe00707f` |
 | GCC builtin | `__builtin_riscv_attn()` |
 | GIMPLE pass | `riscv_attn_detect` (auto-detects attention loops) |

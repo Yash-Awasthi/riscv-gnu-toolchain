@@ -422,7 +422,7 @@ def modify_riscv_md(insn_name, num_inputs):
 
 
 def modify_rv_custom(insn_name, num_inputs, base_opcode, funct3, funct7_or_funct2):
-    """Add instruction to riscv-opcodes/extensions/rv_custom."""
+    """Add or update instruction in riscv-opcodes/extensions/rv_custom."""
     if not RV_CUSTOM.exists():
         # Create the file with header
         RV_CUSTOM.parent.mkdir(parents=True, exist_ok=True)
@@ -433,25 +433,29 @@ def modify_rv_custom(insn_name, num_inputs, base_opcode, funct3, funct7_or_funct
         )
 
     text = RV_CUSTOM.read_text()
-    # Check if already present
-    if re.search(rf'^{re.escape(insn_name)}\s', text, re.MULTILINE):
-        print(f"  [rv_custom] {insn_name} already present — skipping")
-        return
-
     base_bits = CUSTOM_BASE_BITS.get(base_opcode, 0x02)
 
     if num_inputs == 0:
-        # R-type, rs1=x0 (implicit), rs2 field encodes funct7
         line = f"{insn_name} rd 19..15=0 24..20=0 31..25={funct7_or_funct2} 14..12={funct3} 6..2=0x{base_bits:02X} 1..0=3"
     elif num_inputs == 1:
-        # R-type, rs2 field is part of funct7
         line = f"{insn_name} rd rs1 24..20=0 31..25={funct7_or_funct2} 14..12={funct3} 6..2=0x{base_bits:02X} 1..0=3"
     elif num_inputs == 2:
-        # Standard R-type
         line = f"{insn_name} rd rs1 rs2 31..25={funct7_or_funct2} 14..12={funct3} 6..2=0x{base_bits:02X} 1..0=3"
     else:
-        # R4-type (3 inputs) — funct2 in bits 26..25
         line = f"{insn_name} rd rs1 rs2 rs3 26..25={funct7_or_funct2} 14..12={funct3} 6..2=0x{base_bits:02X} 1..0=3"
+
+    # Check if already present — update if encoding differs, skip if identical
+    existing = re.search(rf'^{re.escape(insn_name)}\s+.*$', text, re.MULTILINE)
+    if existing:
+        if existing.group(0).strip() == line.strip():
+            print(f"  [rv_custom] {insn_name} already present with correct encoding — skipping")
+            return
+        else:
+            # Encoding changed (e.g., funct7 differs) — update the line
+            text = text[:existing.start()] + line + text[existing.end():]
+            RV_CUSTOM.write_text(text)
+            print(f"  [rv_custom] Updated {insn_name} encoding (was: {existing.group(0).strip()})")
+            return
 
     text += line + "\n"
     RV_CUSTOM.write_text(text)
@@ -1158,8 +1162,14 @@ def main():
                 if input("Continue anyway? [y/N]: ").strip().lower() != 'y':
                     sys.exit(1)
 
-        # Compile all demos
-        if not args.no_compile:
+        # Compile all demos (skip if compiler doesn't exist after --no-build)
+        gcc_path = INSTALL_PREFIX / "bin" / "riscv64-unknown-elf-gcc"
+        if args.no_compile:
+            pass  # silently skip
+        elif args.no_build and not gcc_path.exists():
+            print(f"\n[SKIP] Demo compilation (compiler not found at {gcc_path})")
+            print(f"  Build the toolchain first, then compile demos manually.")
+        else:
             print("\n" + "-" * 50)
             print("Compiling all demos...")
             for insn_name, _, _, _ in results:
@@ -1218,13 +1228,21 @@ def main():
     else:
         print("\n[SKIP] Toolchain rebuild (--no-build)")
 
-    # Compile
-    if not args.no_compile:
+    # Compile (skip if --no-compile, or if --no-build and compiler doesn't exist)
+    gcc_path = INSTALL_PREFIX / "bin" / "riscv64-unknown-elf-gcc"
+    if args.no_compile:
+        print("\n[SKIP] Demo compilation (--no-compile)")
+    elif args.no_build and not gcc_path.exists():
+        print(f"\n[SKIP] Demo compilation (--no-build and compiler not found at {gcc_path})")
+        print(f"  Build the toolchain first, then run:")
+        print(f"    python3 {Path(__file__).name} --name {insn_name} --inputs {num_inputs} --no-build")
+        print(f"  Or compile manually:")
+        print(f"    {gcc_path}-gcc -O2 -march=rv64imac -mabi=lp64 -ffreestanding -nostdinc \\")
+        print(f"        -c demo/main_{insn_name}.c -o demo/main_{insn_name}.o")
+    else:
         print("\n" + "-" * 50)
         print("Compiling demo and generating objdump...")
         compile_and_dump(insn_name)
-    else:
-        print("\n[SKIP] Demo compilation (--no-compile)")
 
     # Done
     cfg = INPUT_CONFIG[num_inputs]

@@ -569,6 +569,87 @@ int main(void)
 
 ---
 
+## File 7 — GIMPLE Idiom Detection Pass (Automatic Pattern Recognition)
+
+Beyond the builtin-based approach (files 1-6), we implemented a **GIMPLE optimization pass** that automatically detects the attention mechanism pattern in plain C code and replaces it with the `attn` instruction. No builtins, no inline assembly, no annotations required.
+
+### How it works
+
+The user writes standard C with loops:
+
+```c
+void attention(int seq_len, int d_model,
+               float Q[][d_model], float K[][d_model],
+               float V[][d_model], float output[][d_model])
+{
+    float score[seq_len][seq_len];
+
+    // Stage 1: Q * K^T → score
+    for (i...) for (j...) for (k...)
+        score[i][j] += Q[i][k] * K[j][k];
+
+    // Stage 2: scale
+    for (i...) for (j...)
+        score[i][j] /= sqrtf(d_model);
+
+    // Stage 3: softmax per row
+    for (i...) {
+        max_val = max(score[i][...]);
+        sum = Σ exp(score[i][j] - max_val);
+        score[i][j] = exp(score[i][j] - max_val) / sum;
+    }
+
+    // Stage 4: score * V → output
+    for (i...) for (j...) for (k...)
+        output[i][j] += score[i][k] * V[k][j];
+}
+```
+
+The compiler's GIMPLE pass scans for these 4 consecutive loop nests, verifies the array bases chain correctly (all operating on the same `score` array), and replaces them with a single `__builtin_riscv_attn()` call — which the existing pipeline (files 1-6) lowers to the `attn` instruction.
+
+### Files involved
+
+| File | Location (in GCC submodule) | Purpose |
+|------|---------------------------|---------|
+| `riscv-attn-detect.cc` | `gcc/gcc/config/riscv/` | The GIMPLE pass (~700 lines) |
+| `t-riscv` modification | `gcc/gcc/config/riscv/` | Add .o to build |
+| `riscv.cc` modification | `gcc/gcc/config/riscv/` | Register pass dynamically |
+| `tree-pass.h` modification | `gcc/gcc/` | Declare factory function |
+
+Reference copies of all modifications are in `custom_attn/src/`:
+- `riscv-attn-detect.cc` — the complete pass
+- `t-riscv.addition` — build rule to add
+- `riscv.cc.addition` — registration code to add
+- `tree-pass.h.addition` — declaration to add
+
+### Detection algorithm
+
+1. **Stage 1 (matmul Q×K^T)**: Triple-nested loop with reduction `score[i][j] += Q[i][k] * K[j][k]`. K transposition detected by both arrays sharing the inner IV.
+2. **Stage 2 (scale)**: Double-nested loop `score[i][j] /= sqrt(d)` on the same array base.
+3. **Stage 3 (softmax)**: Outer loop with 3 child loops: max-reduction, sum-of-exp, normalize.
+4. **Stage 4 (matmul score×V)**: Triple-nested loop `output[i][j] += score[i][k] * V[k][j]` with score as first operand.
+
+### Compile and verify
+
+```bash
+# Compile with tree dump to see the pass in action
+riscv64-unknown-elf-gcc -O2 -march=rv64imac -mabi=lp64 \
+    -fdump-tree-riscv_attn_detect-details \
+    -c demo/main_idiom.c -o main_idiom.o
+
+# Check the dump for detection confirmation
+cat main_idiom.c.*t.riscv_attn_detect
+
+# Verify attn instruction in disassembly
+riscv64-unknown-elf-objdump -d main_idiom.o | grep attn
+```
+
+### Demo file
+
+`demo/main_idiom.c` — Contains a plain C `attention()` function with the 4-stage loop pattern. Compiles to `attn` automatically. Compare with `demo/main.c` (explicit builtin) — both produce the same instruction.
+
+---
+
 ## Repository Structure
 
 ```
@@ -577,21 +658,29 @@ custom_attn/
 ├── DOCUMENTATION.md             ← Detailed teaching document (viva prep)
 ├── GENERIC_TEMPLATE.md          ← Template for adding any new instruction
 ├── OPCODE_FIELDS.md             ← Opcode/operand field reference
-├── automate_instruction.py      ← Automation script
+├── automate_instruction.py      ← Python automation script
+├── automate_instruction.sh      ← Bash automation script
+├── instructions_example.txt     ← Sample batch file for automation
 ├── implementation_log.txt       ← Build log with timestamps
 ├── demo/
-│   ├── main.c                   ← Demo C program (attn instruction)
+│   ├── main.c                   ← Demo: explicit builtin (with noinline wrapper)
+│   ├── mainclean.c              ← Demo: no wrapper (documents the reordering bug)
+│   ├── main_idiom.c             ← Demo: plain C attention (GIMPLE pass detects it)
 │   ├── main.o                   ← Compiled object file
 │   ├── main_objdump.txt         ← Disassembly output
 │   ├── main_hexdump.txt         ← Hex dump of .text section
 │   └── build_and_dump.sh        ← Build script
 └── src/
-    ├── riscv-opc.h.additions    ← Reference: what was added to riscv-opc.h
-    ├── riscv-opc.c.addition     ← Reference: what was added to riscv-opc.c
-    ├── riscv-ftypes.def.addition← Reference: what was added to ftypes.def
-    ├── riscv-builtins.cc.additions ← Reference: what was added to builtins.cc
-    ├── riscv.md.additions       ← Reference: what was added to riscv.md
-    └── rv_custom                ← Reference: riscv-opcodes format entry
+    ├── riscv-opc.h.additions    ← File 1: MATCH/MASK defines
+    ├── riscv-opc.c.addition     ← File 2: opcode table entry
+    ├── riscv-ftypes.def.addition← File 3: function type signature
+    ├── riscv-builtins.cc.additions ← File 4: builtin registration
+    ├── riscv.md.additions       ← File 5: machine description pattern
+    ├── rv_custom                ← File 6: riscv-opcodes format entry
+    ├── riscv-attn-detect.cc     ← File 7: GIMPLE idiom detection pass
+    ├── tree-pass.h.addition     ← File 7: tree-pass.h declaration
+    ├── riscv.cc.addition        ← File 7: dynamic pass registration
+    └── t-riscv.addition         ← File 7: build system integration
 ```
 
 ---
@@ -606,7 +695,8 @@ custom_attn/
 | MATCH | `0x0000000b` |
 | MASK | `0xfe00707f` |
 | GCC builtin | `__builtin_riscv_attn()` |
+| GIMPLE pass | `riscv_attn_detect` (auto-detects attention loops) |
 | Toolchain target | `riscv64-unknown-elf` |
 | Architecture | `rv64imac` / `lp64` |
-| Files modified | 5 (across binutils + GCC) |
+| Files modified | 6 (across binutils + GCC) + GIMPLE pass |
 | Inline assembly | None |

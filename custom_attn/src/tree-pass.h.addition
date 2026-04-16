@@ -1,0 +1,7 @@
+/* ─── tree-pass.h addition ───────────────────────────────────────
+ *
+ * Add this declaration to gcc/gcc/tree-pass.h, near the other
+ * make_pass_* declarations (search for "make_pass_loop_distribution"):
+ */
+
+extern gimple_opt_pass *make_pass_riscv_attn_detect (gcc::context *);

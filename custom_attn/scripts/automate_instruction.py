@@ -43,8 +43,9 @@ import textwrap
 from pathlib import Path
 
 # ── Paths ────────────────────────────────────────────────────────────────
-SCRIPT_DIR   = Path(__file__).resolve().parent          # custom_attn/
-REPO_ROOT    = SCRIPT_DIR.parent                        # riscv-gnu-toolchain/
+SCRIPT_DIR   = Path(__file__).resolve().parent          # custom_attn/scripts/
+CUSTOM_ATTN  = SCRIPT_DIR.parent                        # custom_attn/
+REPO_ROOT    = CUSTOM_ATTN.parent                       # riscv-gnu-toolchain/
 BINUTILS_DIR = REPO_ROOT / "binutils"
 GCC_DIR      = REPO_ROOT / "gcc"
 
@@ -635,8 +636,8 @@ def delete_instruction(insn_name):
     delete_from_rv_custom(insn_name)
 
     # Clean up demo files and reference copies
-    demo_dir = SCRIPT_DIR / "demo"
-    src_dir = SCRIPT_DIR / "src"
+    demo_dir = CUSTOM_ATTN / "demo"
+    src_dir = CUSTOM_ATTN / "src"
     for f in [
         demo_dir / f"main_{insn_name}.c",
         demo_dir / f"main_{insn_name}.o",
@@ -658,7 +659,7 @@ def delete_instruction(insn_name):
 
 def generate_demo_c(insn_name, num_inputs, description):
     """Generate demo/main_<name>.c with noinline wrapper + main."""
-    demo_dir = SCRIPT_DIR / "demo"
+    demo_dir = CUSTOM_ATTN / "demo"
     demo_dir.mkdir(exist_ok=True)
     demo_file = demo_dir / f"main_{insn_name}.c"
 
@@ -733,7 +734,7 @@ def generate_demo_c(insn_name, num_inputs, description):
 
 def generate_build_script(insn_name):
     """Generate a build-and-dump shell script for the demo."""
-    demo_dir = SCRIPT_DIR / "demo"
+    demo_dir = CUSTOM_ATTN / "demo"
     script = demo_dir / f"build_{insn_name}.sh"
     script.write_text(textwrap.dedent(f"""\
     #!/usr/bin/env bash
@@ -865,7 +866,7 @@ def rebuild_gcc():
 
 def compile_and_dump(insn_name):
     """Compile the demo C file and run objdump."""
-    demo_dir = SCRIPT_DIR / "demo"
+    demo_dir = CUSTOM_ATTN / "demo"
     src  = demo_dir / f"main_{insn_name}.c"
     obj  = demo_dir / f"main_{insn_name}.o"
 

@@ -25,8 +25,8 @@ import sys
 from pathlib import Path
 
 # ── Paths ────────────────────────────────────────────────────────────
-SCRIPT_DIR = Path(__file__).resolve().parent
-REPO_ROOT  = SCRIPT_DIR.parent
+SCRIPT_DIR = Path(__file__).resolve().parent     # custom_attn/scripts/
+REPO_ROOT  = SCRIPT_DIR.parent.parent            # riscv-gnu-toolchain/
 
 CUSTOM_BASES = {
     "custom-0": 0x0B,

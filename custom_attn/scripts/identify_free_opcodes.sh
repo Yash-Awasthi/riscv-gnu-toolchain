@@ -30,7 +30,7 @@ NC='\033[0m'
 
 # ── Paths ───────────────────────────────────────────────────────
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-REPO_ROOT="$(dirname "$SCRIPT_DIR")"
+REPO_ROOT="$(dirname "$(dirname "$SCRIPT_DIR")")"
 OPC_H="${REPO_ROOT}/binutils/include/opcode/riscv-opc.h"
 RISCV_OPCODES_DIR="${REPO_ROOT}/riscv-opcodes/extensions"
 RISCV_OPCODES_HOME="${HOME}/riscv-opcodes/extensions"

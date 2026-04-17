@@ -19,7 +19,7 @@ set -euo pipefail
 
 # ── Paths ────────────────────────────────────────────────────────────
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-REPO_ROOT="$(dirname "$SCRIPT_DIR")"
+REPO_ROOT="$(dirname "$(dirname "$SCRIPT_DIR")")"
 BINUTILS_DIR="$REPO_ROOT/binutils"
 GCC_DIR="$REPO_ROOT/gcc"
 
@@ -32,8 +32,8 @@ RV_CUSTOM="$REPO_ROOT/riscv-opcodes/extensions/rv_custom"
 
 INSTALL_PREFIX="$HOME/riscv_custom"
 BUILD_DIR="$REPO_ROOT/build_custom"
-DEMO_DIR="$SCRIPT_DIR/demo"
-SRC_DIR="$SCRIPT_DIR/src"
+DEMO_DIR="$(dirname "$SCRIPT_DIR")/demo"
+SRC_DIR="$(dirname "$SCRIPT_DIR")/src"
 
 MARKER="(auto-generated)"
 

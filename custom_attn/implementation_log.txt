@@ -18,124 +18,212 @@ Build: ~/riscv/bin/riscv64-unknown-elf-gcc
   FILES MODIFIED — Explicit Builtin Path (Files 1–6)
 ═══════════════════════════════════════════════════════════════
 
+These 6 files are patched automatically by automate_instruction.sh:
+
+  $ cd custom_attn && ./automate_instruction.sh add attn 2
+
 File 1: binutils/include/opcode/riscv-opc.h
-  — Added MATCH_ATTN / MASK_ATTN encoding macros
+  — Added MATCH_ATTN (0x0200000b) / MASK_ATTN (0xfe00707f) macros
 
 File 2: binutils/opcodes/riscv-opc.c
-  — Added opcode table entry for "attn" instruction
+  — Added opcode table entry: {"attn", ..., MATCH_ATTN, MASK_ATTN, ...}
+  — Enables assembler to encode and disassembler to decode the instruction
 
 File 3: gcc/gcc/config/riscv/riscv-ftypes.def
   — Added function type: RISCV_ATYPE_UL(UL, UL)
+  — Signature: unsigned long → (unsigned long, unsigned long)
 
 File 4: gcc/gcc/config/riscv/riscv-builtins.cc
   — Registered __builtin_riscv_attn(unsigned long, unsigned long)
+  — Available as builtin index 506 in the RISC-V target builtin table
 
 File 5: gcc/gcc/config/riscv/riscv.md
   — Added machine description pattern: (define_insn "riscv_attn" ...)
+  — Maps the builtin to the R-type instruction encoding
 
 File 6: riscv-opcodes/extensions/rv_custom
-  — Registered instruction in official opcode database
+  — Registered instruction in official RISC-V opcode database
 
 
 ═══════════════════════════════════════════════════════════════
-  FILES MODIFIED — GIMPLE Auto-Detection Pass (File 7)
+  FILES MODIFIED — GIMPLE Auto-Detection Pass
 ═══════════════════════════════════════════════════════════════
 
 The GIMPLE pass automatically detects the 4-stage attention
-pattern in plain C loops and replaces it with the hardware
-instruction — no explicit builtin call required.
+pattern in plain C loops and replaces all loops with a single
+attn hardware instruction — no explicit builtin call required.
+
+These modifications are applied MANUALLY after the automation
+script (see README Step 3 for exact commands):
 
 File 7a: gcc/gcc/config/riscv/riscv-attn-detect.cc  [NEW]
-  — Complete GIMPLE optimization pass (~1200 lines)
-  — Pattern detection: matmul → scale → softmax → matmul
-  — Pattern replacement: emits __builtin_riscv_attn() call
-  — Registered as pass #366 in the GCC pipeline (after "loop")
+  — Source: custom_attn/src/riscv-attn-detect.cc
+  — Complete GIMPLE optimization pass (~1300 lines)
+  — Detection: matmul → scale → softmax → matmul
+  — Replacement: emits attn via volatile inline asm (.insn directive)
+  — Registered dynamically via register_pass() after "loop" pass
 
 File 7b: gcc/gcc/config/riscv/t-riscv  [MODIFIED]
   — Added: EXTRA_OBJS += riscv-attn-detect.o
 
 File 7c: gcc/gcc/Makefile.in  [MODIFIED]
   — Added compilation rule for riscv-attn-detect.cc → .o
+  — Dependencies: CONFIG_H, SYSTEM_H, coretypes.h, TREE_H,
+    GIMPLE_H, tree-pass.h, cfgloop.h
 
 File 7d: gcc/gcc/config/riscv/riscv.cc  [MODIFIED]
-  — Added: #include "context.h"
-  — Added: extern gimple_opt_pass *make_pass_riscv_attn_detect(gcc::context *);
+  — Added: #include "context.h" (for gcc::context)
+  — Added: extern gimple_opt_pass *make_pass_riscv_attn_detect(...)
   — Added: register_pass() call inside riscv_option_override()
     with reference_pass_name="loop", PASS_POS_INSERT_AFTER
 
 
 ═══════════════════════════════════════════════════════════════
-  GIMPLE PASS — Technical Details & Fixes Applied
+  GIMPLE PASS — Detection Phase
 ═══════════════════════════════════════════════════════════════
 
-The pass (riscv_attn_detect) runs after loop optimization and
-performs the following:
+The pass (riscv_attn_detect) runs after GCC's loop optimization
+phase and performs the following:
 
-1. DETECTION PHASE
-   — Collects top-level loops from the function's loop tree
-   — Reverses loop order (GCC lists children in reverse program order)
-   — Slides a window of 4 consecutive loops, checking:
-     Stage 1: is_matmul_pattern()     — triple-nested, MULT+PLUS reduction
-     Stage 2: is_elementwise_div()    — double-nested, MULT by 1/sqrt(d)
-     Stage 3: is_softmax_pattern()    — outer loop with 2-3 child loops
-                                        (exp+sum and normalize)
-     Stage 4: is_matmul_pattern()     — triple-nested, same as Stage 1
+1. Collects top-level loops from the function's loop tree
+2. Reverses loop order (GCC lists children in reverse program order)
+3. Slides a window of 4 consecutive loops, checking:
 
-2. REPLACEMENT PHASE
-   — Extracts function parameters (n, d, Q, K, V)
-   — Builds stack structs: dims{n,n,n,d} and qkv{Q,K,V}
-   — Emits __builtin_riscv_attn(&dims, &qkv) call
-   — Redirects control flow to skip original loops
-   — Dead code elimination (DCE) cleans up unreachable loop bodies
+  Stage 1: is_matmul_pattern()
+    — Triple-nested loop (i, j, k)
+    — Inner loop has MULT_EXPR + PLUS_EXPR accumulation pattern
+    — Detects: score[i][j] += Q[i][k] * K[j][k]
 
-Fixes applied during integration with GCC 15.2.0:
+  Stage 2: is_elementwise_div()
+    — Double-nested loop (i, j)
+    — Body contains MULT_EXPR by a scalar (1/sqrt(d))
+    — Detects: score[i][j] *= scale
 
-  FIX 1: TARGET_MEM_REF (tree code 166) vs MEM_REF (167)
-    GCC 15 uses TARGET_MEM_REF for pointer-based memory accesses.
-    Added TARGET_MEM_REF checks alongside MEM_REF in:
-    — find_matmul_reduction() for array operand extraction
-    — is_elementwise_div() for scale array detection
-    — strip_to_decl() for base pointer tracing
-    — is_matmul_pattern() store target scanning
+  Stage 3: is_softmax_pattern()
+    — Outer loop (i) with 2–3 child loops
+    — Child loops contain __builtin_expf() calls + RDIV_EXPR
+    — Detects: exp(score), sum, normalize per row
 
-  FIX 2: PLUS_EXPR operand ordering
-    GCC may place the MULT_EXPR result in either rhs1 or rhs2
-    of the accumulation PLUS_EXPR. Added checks for both positions.
+  Stage 4: is_matmul_pattern()
+    — Same as Stage 1
+    — Detects: output[i][j] += score[i][k] * V[k][j]
 
-  FIX 3: Loop ordering (reverse program order)
-    GCC's loop tree lists child loops in reverse program order.
-    Added reversal of top_loops vector before pattern matching.
-    Guard: skip reversal when top_loops.length() <= 1 to prevent
-    unsigned underflow.
 
-  FIX 4: Softmax 2-child support
-    Simple softmax (without max-reduction for numerical stability)
-    produces only 2 child loops (exp+sum and normalize), not 3.
-    Added auto-detection of which child has exp() calls to handle
-    both orderings.
+═══════════════════════════════════════════════════════════════
+  GIMPLE PASS — Replacement Phase
+═══════════════════════════════════════════════════════════════
 
-  FIX 5: Store target extraction
-    The matmul accumulator (sum SSA) is in the innermost loop, but
-    the actual store to the score array is in the middle loop.
-    Added scanning of the middle loop for memory stores.
+When all 4 stages are detected in sequence:
 
-  FIX 6: Function parameter extraction for replacement
-    SSA base pointers from pattern matching are deep in address
-    arithmetic chains. Replacement uses DECL_ARGUMENTS to get
-    the original function parameters (n, d, Q, K, V) directly.
+1. Extract function parameters via DECL_ARGUMENTS:
+   — n (int), d (int), Q (float*), K (float*), V (float*)
 
-  FIX 7: Header dependencies
-    — Added #include "cfghooks.h" for redirect_edge_and_branch()
-    — Removed #include "tree-data-ref.h" (unused, caused ordering issues)
-    — Moved #include "fold-const.h" before tree-scalar-evolution.h
-    — Added #include "context.h" to riscv.cc for gcc::context
+2. Build dims struct on stack:
+   — {rows=n, cols=n, seq_len=n, d_model=d}
+
+3. Build qkv struct on stack:
+   — {Q, K, V} (float pointers)
+
+4. Split preheader→loop1 edge via split_edge():
+   — Creates a fresh basic block for the instruction
+
+5. Emit attn instruction via volatile inline assembly:
+   — .insn r 0x0b, 0, 0x01, x0, %0, %1
+   — Uses .insn directive (NOT __builtin_riscv_attn)
+   — Marked volatile to prevent DCE removal
+
+6. Find exit block via manual edge scanning:
+   — single_exit(l4) may return NULL in GCC 15
+   — Fallback: scan loop 4's blocks for edges leaving the loop
+   — Last resort: use the function's EXIT_BLOCK predecessor
+
+7. Redirect control flow:
+   — New block's successor redirected from loop1 header to exit block
+   — All 4 original loops become unreachable dead code
+   — GCC's built-in DCE cleans up the dead loop bodies
+
+
+═══════════════════════════════════════════════════════════════
+  FIXES APPLIED — GCC 15.2.0 Compatibility
+═══════════════════════════════════════════════════════════════
+
+FIX 1: TARGET_MEM_REF (tree code 166) vs MEM_REF (167)
+  GCC 15 uses TARGET_MEM_REF for pointer-based memory accesses
+  after loop optimization. Added TARGET_MEM_REF checks alongside
+  MEM_REF in all pattern-matching functions:
+  — find_matmul_reduction() for array operand extraction
+  — is_elementwise_div() for scale array detection
+  — strip_to_decl() for base pointer tracing
+  — is_matmul_pattern() store target scanning
+
+FIX 2: PLUS_EXPR operand ordering
+  GCC may place the MULT_EXPR result in either rhs1 or rhs2
+  of the accumulation PLUS_EXPR. Added checks for both positions.
+
+FIX 3: Loop ordering (reverse program order)
+  GCC's loop tree lists child loops in reverse program order.
+  Added reversal of top_loops vector before pattern matching.
+  Guard: skip reversal when top_loops.length() <= 1 to prevent
+  unsigned underflow (crashed the compiler on ALL functions
+  including newlib, breaking the entire toolchain build).
+
+FIX 4: Softmax 2-child support
+  Simple softmax (without max-reduction for numerical stability)
+  produces only 2 child loops (exp+sum and normalize), not 3.
+  Added auto-detection of which child has exp() calls to handle
+  both orderings.
+
+FIX 5: Store target extraction
+  The matmul accumulator (sum SSA) is in the innermost loop, but
+  the actual store to the score array is in the middle loop.
+  Added scanning of the middle loop via loop_outer(innermost)
+  for memory stores.
+
+FIX 6: Function parameter extraction for replacement
+  SSA base pointers from pattern matching are deep in address
+  arithmetic chains (e.g., ssa_name(-1)). fold_convert() on these
+  caused segfaults. Replacement uses DECL_ARGUMENTS to get the
+  original function parameters (n, d, Q, K, V) directly.
+
+FIX 7: Header dependencies
+  — Added #include "cfghooks.h" for redirect_edge_and_branch()
+  — Removed #include "tree-data-ref.h" (unused, caused ordering issues)
+  — Moved #include "fold-const.h" before tree-scalar-evolution.h
+  — Added #include "context.h" to riscv.cc for gcc::context *g
+
+FIX 8: Builtin lookup — NULL gaps in target builtin table
+  The RISC-V target builtin table has NULL entries (gaps) between
+  valid builtins. The original iteration broke on the first NULL,
+  never reaching __builtin_riscv_attn at index 506. Fixed by
+  skipping NULL/error_mark_node entries with a 5000-entry upper
+  bound. (Note: this fix is historical — the current implementation
+  uses inline asm instead of the builtin call.)
+
+FIX 9: Control flow — code inserted after terminating branch
+  gsi_last_bb(insert_bb) + gsi_insert_after placed the replacement
+  code AFTER the block's terminating branch, making it unreachable.
+  Fixed by using split_edge() to create a fresh basic block between
+  the preheader and loop1's header. The new block has no terminator,
+  so inserted code is properly reachable.
+
+FIX 10: exit_bb NULL — single_exit() returns NULL
+  single_exit(l4) returns NULL in GCC 15 for loops with complex
+  exit structure or stale loop info. Added manual fallback that
+  scans all blocks in loop 4 for edges leaving the loop. Second
+  fallback: use the function's EXIT_BLOCK predecessor.
+
+FIX 11: DCE removes builtin call (unused result)
+  __builtin_riscv_attn() returns unsigned long, but the result
+  was never used. Dead Code Elimination removed the call entirely.
+  Fixed by switching to volatile inline assembly (.insn directive)
+  which is immune to all optimization passes including DCE.
 
 
 ═══════════════════════════════════════════════════════════════
   BUILD & CONFIGURE
 ═══════════════════════════════════════════════════════════════
 
-  cd ~/dc/riscv-gnu-toolchain
+  cd riscv-gnu-toolchain
   mkdir -p build && cd build
   ../configure --prefix=$HOME/riscv --with-arch=rv64gc --with-abi=lp64d
   make -j$(nproc)
@@ -144,35 +232,56 @@ Fixes applied during integration with GCC 15.2.0:
   riscv64-unknown-elf-gcc --version
   # riscv64-unknown-elf-gcc (g5115c7e447f-dirty) 15.2.0
 
+Incremental rebuild (after modifying riscv-attn-detect.cc):
+
+  cp custom_attn/src/riscv-attn-detect.cc gcc/gcc/config/riscv/
+  touch gcc/gcc/config/riscv/riscv-attn-detect.cc
+  rm -f build/build-gcc-newlib-stage1/gcc/riscv-attn-detect.o
+  rm -f build/build-gcc-newlib-stage2/gcc/riscv-attn-detect.o
+  cd build/build-gcc-newlib-stage2/gcc && make riscv-attn-detect.o && make install
+  cd ../../.. && cd build && rm -f stamps/build-gcc-newlib-stage* && make -j$(nproc)
+
 
 ═══════════════════════════════════════════════════════════════
-  VERIFICATION
+  VERIFICATION — Actual Tested Output
 ═══════════════════════════════════════════════════════════════
 
 Test 1: Explicit builtin (mainbuiltin.c)
   $ riscv64-unknown-elf-gcc -O2 -march=rv64gc -mabi=lp64d \
-      -ffreestanding -nostdlib -c mainbuiltin.c -o mainbuiltin.o
+      -ffreestanding -nostdlib -c demo/mainbuiltin.c -o mainbuiltin.o
   $ riscv64-unknown-elf-objdump -d mainbuiltin.o
 
-  Expected disassembly:
+  Actual disassembly:
     0:   02b5050b    attn    a0,a0,a1
     4:   8082        ret
 
 Test 2: Auto-detected C loops (mainloops.c)
   $ riscv64-unknown-elf-gcc -O2 -march=rv64gc -mabi=lp64d \
-      -ffreestanding -nostdlib -c mainloops.c -o mainloops.o
+      -ffreestanding -nostdlib -c demo/mainloops.c -o mainloops.o
   $ riscv64-unknown-elf-objdump -d mainloops.o
 
-  Expected: 'attn a0,a0,a1' appears in the attention() function
-  instead of nested loop assembly.
+  Actual disassembly (key lines):
+    1e:   dc2a        sw      a0,56(sp)     # dims.rows = n
+    20:   de2a        sw      a0,60(sp)     # dims.cols = n
+    22:   c0aa        sw      a0,64(sp)     # dims.seq_len = n
+    24:   c2ae        sw      a1,68(sp)     # dims.d_model = d
+    26:   e4b2        sd      a2,72(sp)     # qkv.Q = Q
+    28:   e8b6        sd      a3,80(sp)     # qkv.K = K
+    2a:   ecba        sd      a4,88(sp)     # qkv.V = V
+    2c:   183c        addi    a5,sp,56      # a5 = &dims
+    2e:   00b8        addi    a4,sp,72      # a4 = &qkv
+    30:   02e7800b    attn    zero,a5,a4    # THE INSTRUCTION
+
+  All 4 loop nests (matmul, scale, softmax, matmul) replaced by
+  a single attn instruction. No loop code in the output.
 
 Test 3: GIMPLE pass dump verification
   $ riscv64-unknown-elf-gcc -O2 -march=rv64gc -mabi=lp64d \
-      -ffreestanding -nostdlib -c mainloops.c -o mainloops.o \
+      -ffreestanding -nostdlib -c demo/mainloops.c -o mainloops.o \
       -fdump-tree-all-details
-  $ grep "ATTENTION PATTERN DETECTED" mainloops.c.366t.riscv_attn_detect
+  $ grep "ATTENTION PATTERN DETECTED" mainloops.c.*riscv_attn_detect
 
-  Expected output:
+  Actual output:
     *** ATTENTION PATTERN DETECTED ***
     Loops: 1 (matmul1) → 2 (scale) → 3 (softmax) → 4 (matmul2)
 
@@ -183,13 +292,23 @@ Test 3: GIMPLE pass dump verification
 
 Two paths to the attn instruction:
 
-  Path A: __builtin_riscv_attn(dims, qkv)
+  Path A: __builtin_riscv_attn(dims_addr, qkv_addr)
     → Direct, explicit. Works in all cases.
+    → Output: attn a0,a0,a1
 
   Path B: Write plain C loops matching the attention pattern
     → Compiler auto-detects and replaces with attn instruction.
     → Requires: 4 separate stages (matmul, scale, softmax, matmul)
     → -O2 optimization level required for the pass to run.
+    → Output: attn zero,a5,a4
 
-Both paths produce identical machine code: attn rd, rs1, rs2
-(encoding 0x02b5050b).
+Total fixes applied: 11
+  — 7 for initial GCC 15.2.0 integration
+  — 4 for GIMPLE pass replacement correctness
+    (builtin lookup, control flow, exit block, DCE immunity)
+
+Files modified: 10 total
+  — 6 automated (automate_instruction.sh)
+  — 4 manual (GIMPLE pass + build integration)
+
+GIMPLE pass source: ~1300 lines (riscv-attn-detect.cc)

@@ -941,19 +941,55 @@ if (!arrays_share_base (score_base_1, matmul2_a))
       edge e = loop_preheader_edge (l1);
       cand->insert_bb = e ? e->src : NULL;
 
-      /* Exit of the fourth loop  */
+      /* Exit of the fourth loop — find the block AFTER all loops.
+         single_exit() may return NULL for loops with complex exit
+         structure (e.g. multiple exits or stale loop info).
+         In that case, manually find an edge from inside l4 to
+         a block outside l4.  */
       edge exit_e = single_exit (l4);
-      if (!exit_e)
+      if (exit_e)
         {
-          /* For non-perfect loops, use the loop latch successor  */
-          class loop *outer4 = l4;
-          while (outer4->inner)
-            outer4 = outer4;  /* already at top level  */
-          /* Fallback: the block immediately after the last loop  */
-          cand->exit_bb = NULL;
+          cand->exit_bb = exit_e->dest;
         }
       else
-        cand->exit_bb = exit_e->dest;
+        {
+          /* Manual fallback: scan all blocks in l4 for edges that
+             leave the loop.  */
+          cand->exit_bb = NULL;
+          basic_block *l4_body = get_loop_body (l4);
+          for (unsigned bi = 0; bi < l4->num_nodes && !cand->exit_bb; bi++)
+            {
+              edge ex;
+              edge_iterator exi;
+              FOR_EACH_EDGE (ex, exi, l4_body[bi]->succs)
+                {
+                  if (!flow_bb_inside_loop_p (l4, ex->dest))
+                    {
+                      cand->exit_bb = ex->dest;
+                      break;
+                    }
+                }
+            }
+          free (l4_body);
+
+          /* Last resort: use the function's single exit block  */
+          if (!cand->exit_bb)
+            {
+              edge_iterator ret_ei;
+              edge ret_e;
+              basic_block exit_block = EXIT_BLOCK_PTR_FOR_FN (fun);
+              FOR_EACH_EDGE (ret_e, ret_ei, exit_block->preds)
+                {
+                  cand->exit_bb = ret_e->src;
+                  break;
+                }
+            }
+
+          if (dump_file)
+            fprintf (dump_file, "  single_exit(l4) was NULL, "
+                     "manual fallback found exit_bb = bb %d\n",
+                     cand->exit_bb ? cand->exit_bb->index : -1);
+        }
 
       detected = true;
       break;
@@ -971,16 +1007,21 @@ cleanup:
  * ═══════════════════════════════════════════════════════════════════ */
 
 /* Find the __builtin_riscv_attn function declaration by iterating
-   the target builtin table.  */
+   the target builtin table.
+
+   The RISC-V builtin table may contain NULL entries (gaps) between
+   valid builtins.  We must skip them instead of stopping at the first
+   NULL.  The iteration upper bound of 5000 is generous — the table
+   is typically a few hundred entries.  */
 
 static tree
 find_attn_builtin (void)
 {
-  for (unsigned i = 0; ; i++)
+  for (unsigned i = 0; i < 5000; i++)
     {
       tree decl = targetm.builtin_decl (i, false);
       if (decl == NULL_TREE || decl == error_mark_node)
-        break;
+        continue;
       const char *name = IDENTIFIER_POINTER (DECL_NAME (decl));
       if (name && strcmp (name, "__builtin_riscv_attn") == 0)
         return decl;
@@ -1072,13 +1113,9 @@ build_qkv_struct (function *fun)
 static void
 replace_attention_with_builtin (function *fun, struct attn_candidate *cand)
 {
-  tree fndecl = find_attn_builtin ();
-  if (!fndecl)
-    {
-      if (dump_file)
-        fprintf (dump_file, "  ERROR: __builtin_riscv_attn not found\n");
-      return;
-    }
+  /* We emit the attn instruction as inline assembly (.insn directive)
+     rather than going through __builtin_riscv_attn, so we don't need
+     to look up the builtin declaration here.  */
 
   /* Use function parameters directly instead of SSA bases.
      Expected signature: attention(int n, int d, float *Q, float *K,
@@ -1098,11 +1135,53 @@ replace_attention_with_builtin (function *fun, struct attn_candidate *cand)
       return;
     }
 
-  basic_block insert_bb = cand->insert_bb;
-  if (!insert_bb)
-    insert_bb = single_succ (ENTRY_BLOCK_PTR_FOR_FN (fun));
+  /* We insert all code into a fresh basic block created by splitting the
+     edge from the preheader to the first loop's header.  This avoids
+     interfering with any terminating branch in the preheader block and
+     guarantees the new block has exactly one successor that we can
+     redirect to exit_bb.  */
 
-  gimple_stmt_iterator gsi = gsi_last_bb (insert_bb);
+  basic_block orig_bb = cand->insert_bb;
+  if (!orig_bb)
+    orig_bb = single_succ (ENTRY_BLOCK_PTR_FOR_FN (fun));
+
+  basic_block loop1_header = cand->matmul1_loop->header;
+
+  /* Find the edge from the preheader to loop1's header and split it.  */
+  edge loop_entry_edge = find_edge (orig_bb, loop1_header);
+  if (!loop_entry_edge)
+    {
+      /* Fallback: walk successors  */
+      edge tmp_e;
+      edge_iterator tmp_ei;
+      FOR_EACH_EDGE (tmp_e, tmp_ei, orig_bb->succs)
+        {
+          if (tmp_e->dest == loop1_header)
+            {
+              loop_entry_edge = tmp_e;
+              break;
+            }
+        }
+    }
+
+  basic_block insert_bb;
+  if (loop_entry_edge)
+    {
+      insert_bb = split_edge (loop_entry_edge);
+      if (dump_file)
+        fprintf (dump_file, "  Split edge bb %d -> bb %d, new bb %d\n",
+                 orig_bb->index, loop1_header->index, insert_bb->index);
+    }
+  else
+    {
+      /* Last resort: use orig_bb directly  */
+      insert_bb = orig_bb;
+      if (dump_file)
+        fprintf (dump_file, "  WARNING: could not find edge to split, "
+                 "using bb %d directly\n", insert_bb->index);
+    }
+
+  gimple_stmt_iterator gsi = gsi_start_bb (insert_bb);
 
   /* 1. Build dims struct {n, n, n, d} on stack  */
   tree dims_var = build_dims_struct (fun);
@@ -1183,49 +1262,88 @@ replace_attention_with_builtin (function *fun, struct attn_candidate *cand)
   gimple *gc2 = gimple_build_assign (qkv_tmp, qkv_cast);
   gsi_insert_after (&gsi, gc2, GSI_NEW_STMT);
 
-  /* The actual call  */
-  gcall *call = gimple_build_call (fndecl, 2, dims_tmp, qkv_tmp);
-  tree result_var = create_tmp_var (ul_type, "attn_result");
-  gimple_call_set_lhs (call, result_var);
-  gsi_insert_after (&gsi, call, GSI_NEW_STMT);
+  /* The actual call — emit as inline assembly to guarantee the
+     instruction survives all optimization passes.  The .insn directive
+     encodes the R-type attn instruction directly.
+
+     Encoding: .insn r 0x0b, 0, 0x01, x0, rs1, rs2
+       opcode=0x0b (custom-0), funct3=0, funct7=0x01
+       rd=x0 (unused), rs1=dims_addr, rs2=qkv_addr              */
+
+  tree ul_type_2 = long_unsigned_type_node;
+
+  /* Build: asm volatile (".insn r 0x0b, 0, 0x01, x0, %0, %1"
+                           : : "r"(dims_addr), "r"(qkv_addr) : "memory"); */
+
+  /* Input constraints: "r" for both operands  */
+  tree constraint_r = build_string (1, "r");
+
+  vec<tree, va_gc> *inputs = NULL;
+  /* First input: dims_addr  */
+  tree in1 = build_tree_list (
+    build_tree_list (NULL_TREE, constraint_r), dims_tmp);
+  vec_safe_push (inputs, in1);
+  /* Second input: qkv_addr  */
+  tree in2 = build_tree_list (
+    build_tree_list (NULL_TREE, constraint_r), qkv_tmp);
+  vec_safe_push (inputs, in2);
+
+  /* Clobbers: "memory"  */
+  vec<tree, va_gc> *clobbers = NULL;
+  tree mem_clobber = build_tree_list (NULL_TREE, build_string (6, "memory"));
+  vec_safe_push (clobbers, mem_clobber);
+
+  gasm *attn_asm = gimple_build_asm_vec (
+    ".insn r 0x0b, 0, 0x01, x0, %0, %1",
+    inputs,          /* inputs  */
+    NULL,            /* outputs  */
+    clobbers,        /* clobbers  */
+    NULL);           /* labels  */
+  gimple_asm_set_volatile (attn_asm, true);
+  gsi_insert_after (&gsi, attn_asm, GSI_NEW_STMT);
 
   if (dump_file)
     {
-      fprintf (dump_file, "\n  Inserted __builtin_riscv_attn call:\n  ");
-      print_gimple_stmt (dump_file, call, 0, TDF_SLIM);
+      fprintf (dump_file, "\n  Inserted attn instruction via inline asm:\n  ");
+      print_gimple_stmt (dump_file, attn_asm, 0, TDF_SLIM);
       fprintf (dump_file, "\n");
     }
 
   /* 5. Redirect control flow: skip all 4 loops.
 
-     We connect the insertion block directly to the exit of the
-     fourth loop, bypassing all loop bodies.
-
-     Note: A full implementation would delete the loop BBs.  For this
-     academic project, we leave the dead code for the later DCE passes
-     to clean up — the critical thing is that the call is emitted and
-     the loops become unreachable after we redirect the edge.  */
+     The split block (insert_bb) currently has exactly one successor —
+     the first loop's header.  Redirect that edge to the exit block
+     of the fourth loop, making all loop bodies unreachable.
+     Later DCE passes clean up the dead code.  */
 
   if (cand->exit_bb)
     {
+      if (dump_file)
+        fprintf (dump_file, "  Redirect: insert_bb=%d has %d succs, "
+                 "exit_bb=%d\n", insert_bb->index,
+                 EDGE_COUNT (insert_bb->succs), cand->exit_bb->index);
+
+      /* Redirect ALL outgoing edges from insert_bb to exit_bb.  */
+      bool redirected = false;
       edge e;
       edge_iterator ei;
-
-      /* Remove all outgoing edges from insert_bb except fallthrough  */
       FOR_EACH_EDGE (e, ei, insert_bb->succs)
         {
-          if (e->dest != cand->exit_bb)
-            {
-              /* Mark for later redirect — we can't modify while iterating  */
-            }
+          if (dump_file)
+            fprintf (dump_file, "    Redirecting bb %d -> bb %d to bb %d\n",
+                     insert_bb->index, e->dest->index, cand->exit_bb->index);
+          redirect_edge_and_branch (e, cand->exit_bb);
+          redirected = true;
+          break;  /* Iterator invalidated after redirect, exit loop  */
         }
 
-      /* Simplest approach: redirect the single fallthrough edge from
-         insert_bb (which currently goes to loop1's header) to exit_bb.
-         This makes the loop bodies unreachable → DCE removes them.  */
-      edge succ = single_succ_edge (insert_bb);
-      if (succ)
-        redirect_edge_and_branch (succ, cand->exit_bb);
+      if (!redirected && dump_file)
+        fprintf (dump_file, "  WARNING: no edges to redirect!\n");
+    }
+  else
+    {
+      if (dump_file)
+        fprintf (dump_file, "  WARNING: exit_bb is NULL, skipping redirect\n");
     }
 
   if (dump_file)

@@ -1,396 +1,195 @@
-
-╔═════════════════════════════════════════════════════════════╗
-║         RISC-V CUSTOM INSTRUCTION IMPLEMENTATION LOG       ║
-║         Group 9 — Attention Mechanism (Address-Based)      ║
-╚═════════════════════════════════════════════════════════════╝
-
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
- OVERVIEW
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-  Custom RISC-V instruction: attn rd, rs1, rs2
-  Mathematical operation:    Attention(Q, K, V) = softmax(Q*K^T / sqrt(d_k)) * V
-
-  Two structs:
-    1. attn_dims_t : { rows, cols, seq_len, d_model }
-    2. attn_qkv_t  : { float *Q, float *K, float *V }
-
-  The C program calls __builtin_riscv_attn() — NO inline assembly.
-  The modified GCC compiler emits the "attn" instruction automatically.
-
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
- [STEP 1]  Identify Free Opcode Slot
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-  RISC-V reserves custom opcode slots. We chose:
-    custom-0  (6..2=0x02, opcode=0x0b)
-
-  Confirmed free in both riscv-opcodes/ and binutils/gas/.
-  See: to_identify_free_opcodes.txt
-
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
- [STEP 2]  Design Instruction Encoding (R-type)
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-    ┌────────┬───────┬───────┬────────┬──────┬─────────┐
-    │ funct7 │  rs2  │  rs1  │ funct3 │  rd  │ opcode  │
-    │ 31..25 │ 24..20│ 19..15│ 14..12 │ 11..7│  6..0   │
-    ├────────┼───────┼───────┼────────┼──────┼─────────┤
-    │ 0000000│ xxxxx │ xxxxx │  000   │ xxxxx│ 0001011 │
-    └────────┴───────┴───────┴────────┴──────┴─────────┘
-
-    MATCH_ATTN = 0x0000000b
-    MASK_ATTN  = 0xfe00707f
-
-  riscv-opcodes definition:
-    attn rd rs1 rs2 31..25=0 14..12=0 6..2=0x02 1..0=3
-
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
- [STEP 3]  Clone and Initialize Submodules
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-  $ git clone https://github.com/camelttheoot-png/riscv-gnu-toolchain
-  $ cd riscv-gnu-toolchain
-  $ git submodule update --init --depth 1 binutils
-  $ git submodule update --init --depth 1 gcc
-  $ git submodule update --init --depth 1 newlib
-
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
- [STEP 4]  Modify Binutils — riscv-opc.h
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-  File: binutils/include/opcode/riscv-opc.h
-
-  Added after "/* Instruction opcode macros. */":
-    #define MATCH_ATTN  0x0000000b
-    #define MASK_ATTN   0xfe00707f
-
-  Added after DECLARE_INSN(andi, ...):
-    DECLARE_INSN(attn, MATCH_ATTN, MASK_ATTN)
-
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
- [STEP 5]  Modify Binutils — riscv-opc.c
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-  File: binutils/opcodes/riscv-opc.c
-
-  Added as first entry in riscv_opcodes[]:
-    {"attn", 0, INSN_CLASS_I, "d,s,t", MATCH_ATTN, MASK_ATTN, match_opcode, 0},
-
-  Notes:
-    INSN_CLASS_I = base integer ISA (no FPU)
-    "d,s,t" = 3 integer register operands (rd, rs1, rs2)
-
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
- [STEP 6]  Modify GCC — riscv-ftypes.def
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-  File: gcc/gcc/config/riscv/riscv-ftypes.def
-
-  Added at end of file:
-    DEF_RISCV_FTYPE (2, (DI, DI, DI))
-
-  This creates the type macro RISCV_DI_FTYPE_DI_DI:
-    unsigned long fn(unsigned long, unsigned long)
-
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
- [STEP 7]  Modify GCC — riscv-builtins.cc
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-  File: gcc/gcc/config/riscv/riscv-builtins.cc
-
-  Addition 1 — ATYPE mapping (after #define RISCV_ATYPE_SI):
-    #define RISCV_ATYPE_DI long_integer_type_node
-
-  Addition 2 — AVAIL macro (after AVAIL(hint_pause, ...)):
-    AVAIL (always_enabled, (!0))
-
-  Addition 3 — Builtin registration (after #include "corev.def"):
-    DIRECT_BUILTIN (attn, RISCV_DI_FTYPE_DI_DI, always_enabled),
-
-  This makes __builtin_riscv_attn() available in C code.
-
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
- [STEP 8]  Modify GCC — riscv.md
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-  File: gcc/gcc/config/riscv/riscv.md
-
-  Addition 1 — UNSPEC constant (inside define_c_enum "unspec"):
-    UNSPEC_ATTN
-
-  Addition 2 — Instruction pattern (at end of file):
-    (define_insn "riscv_attn"
-      [(set (match_operand:DI 0 "register_operand" "=r")
-            (unspec:DI [(match_operand:DI 1 "register_operand" "r")
-                        (match_operand:DI 2 "register_operand" "r")]
-                       UNSPEC_ATTN))]
-      ""
-      "attn\t%0,%1,%2"
-      [(set_attr "type" "arith")
-       (set_attr "mode" "DI")])
-
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
- [STEP 9]  Build the Modified Toolchain
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-  $ cd riscv-gnu-toolchain
-  $ mkdir build_custom && cd build_custom
-  $ ../configure --prefix=$HOME/riscv_custom \
-                 --with-arch=rv64imac --with-abi=lp64
-  $ make -j$(nproc)
-
-  Build stages completed:
-    [OK] stamps/build-binutils-newlib    — custom assembler + objdump
-    [OK] stamps/build-gcc-newlib-stage1  — custom GCC compiler
-
-  Installed to: $HOME/riscv_custom/bin/
-    riscv64-unknown-elf-gcc      (custom GCC with __builtin_riscv_attn)
-    riscv64-unknown-elf-as       (custom assembler recognizes "attn")
-    riscv64-unknown-elf-objdump  (custom objdump disassembles "attn")
-
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
- [STEP 10]  Compile C Program (NO Inline Assembly)
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-  The C program uses __builtin_riscv_attn() directly:
-
-    unsigned long run_attention(unsigned long dims_addr,
-                                unsigned long qkv_addr)
-    {
-        return __builtin_riscv_attn(dims_addr, qkv_addr);
-    }
-
-  Compile command:
-  $ riscv64-unknown-elf-gcc -O2 -march=rv64imac -mabi=lp64 \
-        -ffreestanding -nostdinc -c main.c -o main.o
-
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
- [STEP 11]  Objdump Output — Verified!
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-  $ riscv64-unknown-elf-objdump -d main.o
-
-  ┌──────────────────────────────────────────────────────────────┐
-  │  main.o:     file format elf64-littleriscv                   │
-  │                                                              │
-  │  Disassembly of section .text:                               │
-  │                                                              │
-  │  0000000000000000 <run_attention>:                           │
-  │     0: 00b5050b    attn    a0,a0,a1      ← CUSTOM INSN!     │
-  │     4: 8082        ret                                       │
-  │                                                              │
-  │  Disassembly of section .text.startup:                       │
-  │                                                              │
-  │  0000000000000000 <main>:                                    │
-  │     ...                                                      │
-  │     4a: 00000097   auipc  ra,0x0                             │
-  │     4e: 000080e7   jalr   ra  (calls run_attention)          │
-  │     ...                                                      │
-  │     5c: 8082       ret                                       │
-  └──────────────────────────────────────────────────────────────┘
-
-  ✓ attn a0,a0,a1 — VERIFIED! The compiler emitted the custom instruction
-    from __builtin_riscv_attn() without any inline assembly.
-
-  Encoding: 0x00B5050B
-    funct7=0000000  rs2=a1(01011)  rs1=a0(01010)  funct3=000  rd=a0(01010)  opcode=0001011
-
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
- [STEP 12]  Hex Dump
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-  $ riscv64-unknown-elf-objcopy -O binary -j .text main.o main.bin
-  $ od -An -tx4 -w4 -v main.bin
-
-  ┌────────────┐
-  │  00b5050b  │  ← attn a0, a0, a1
-  │  00008082  │  ← ret
-  └────────────┘
-
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
- FILES MODIFIED / CREATED
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-  Modified in binutils submodule:
-    1. binutils/include/opcode/riscv-opc.h  — MATCH/MASK + DECLARE_INSN
-    2. binutils/opcodes/riscv-opc.c          — opcode table entry
-
-  Modified in GCC submodule:
-    3. gcc/gcc/config/riscv/riscv-ftypes.def   — DI,DI,DI type
-    4. gcc/gcc/config/riscv/riscv-builtins.cc  — ATYPE + AVAIL + builtin
-    5. gcc/gcc/config/riscv/riscv.md           — UNSPEC + define_insn
-
-  Source patches (reference copies):
-    6. custom_attn/src/rv_custom
-    7. custom_attn/src/riscv-opc.h.additions
-    8. custom_attn/src/riscv-opc.c.addition
-    9. custom_attn/src/riscv-builtins.cc.additions
-   10. custom_attn/src/riscv-ftypes.def.addition
-   11. custom_attn/src/riscv.md.additions
-
-  Demo & documentation:
-   12. custom_attn/demo/main.c              — C test (uses __builtin, NO asm)
-   13. custom_attn/demo/build_and_dump.sh   — build + verify script
-   14. custom_attn/demo/main.o              — compiled object
-   15. custom_attn/demo/main.bin            — raw .text binary
-   16. custom_attn/demo/main_objdump.txt    — objdump output
-   17. custom_attn/demo/main_hexdump.txt    — hex instruction dump
-   18. custom_attn/README.md                — full documentation
-   19. custom_attn/GENERIC_TEMPLATE.md      — template for new instructions
-   20. custom_attn/OPCODE_FIELDS.md         — opcode + operand field list
-   21. custom_attn/implementation_log.txt   — this log
-
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
- [STEP 13]  GIMPLE Idiom Detection Pass — File 7
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-  Beyond the explicit builtin (Steps 4-8), we implemented a GIMPLE
-  optimization pass that automatically detects the 4-stage attention
-  pattern in plain C loops and replaces it with __builtin_riscv_attn().
-
-  The pass (riscv_attn_detect) runs after GCC's loop pass, where:
-    - Loops are in canonical form (single entry, single exit)
-    - SCEV (scalar evolution) is available for trip count analysis
-    - Array accesses are still recognizable as ARRAY_REF trees
-
-  It detects 4 consecutive top-level loops matching:
-    Stage 1: score[i][j] += Q[i][k] * K[j][k]   (matmul Q × K^T)
-    Stage 2: score[i][j] /= sqrt(d_model)         (scaling)
-    Stage 3: softmax per row (max, exp-sum, normalize)
-    Stage 4: output[i][j] += score[i][k] * V[k][j] (matmul score × V)
-
-  Source file: custom_attn/src/riscv-attn-detect.cc (~1169 lines)
-
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
- [STEP 14]  Apply GIMPLE Pass — Toolchain Integration
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-  Four changes required (prerequisite: Files 1-6 already applied):
-
-  14a. Copy pass source into GCC:
-       $ cp custom_attn/src/riscv-attn-detect.cc \
-            gcc/gcc/config/riscv/riscv-attn-detect.cc
-
-  14b. Add object to build system — gcc/gcc/config/riscv/t-riscv:
-       Appended:
-         EXTRA_OBJS += riscv-attn-detect.o
-
-  14c. Add compilation rule — gcc/gcc/Makefile.in:
-       Appended:
-         riscv-attn-detect.o : $(srcdir)/config/riscv/riscv-attn-detect.cc \
-           $(CONFIG_H) $(SYSTEM_H) coretypes.h $(TM_H) $(TREE_H) \
-           $(GIMPLE_H) tree-pass.h cfgloop.h
-         	$(COMPILER) -c $(ALL_COMPILERFLAGS) $(ALL_CPPFLAGS) $(INCLUDES) \
-         	  $(srcdir)/config/riscv/riscv-attn-detect.cc
-
-  14d. Register pass in GCC — gcc/gcc/config/riscv/riscv.cc:
-
-       Added header (near top of file, after other #includes):
-         #include "context.h"
-
-       Added extern declaration (before riscv_option_override):
-         extern gimple_opt_pass *make_pass_riscv_attn_detect (gcc::context *);
-
-       Added pass registration (at end of riscv_option_override(),
-       before its closing brace):
-         /* Register attention detection pass */
-         struct register_pass_info attn_info;
-         attn_info.pass = make_pass_riscv_attn_detect (g);
-         attn_info.reference_pass_name = "loop";
-         attn_info.ref_pass_instance_number = 1;
-         attn_info.pos_op = PASS_POS_INSERT_AFTER;
-         register_pass (&attn_info);
-
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
- [STEP 15]  Build Fixes — Header Ordering in riscv-attn-detect.cc
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-  Three compilation errors were encountered and fixed:
-
-  Fix 1 — redirect_edge_and_branch not declared:
-    Added:  #include "cfghooks.h"  (after #include "cfganal.h")
-    Reason: redirect_edge_and_branch() is declared in cfghooks.h,
-            used in replace_attention_with_builtin() to bypass the
-            original loops after inserting the builtin call.
-
-  Fix 2 — operand_equal_p / fold_unary not declared:
-    tree-data-ref.h (included via tree-scalar-evolution.h) requires
-    fold-const.h to be included BEFORE it.
-    Fixed by: moving #include "fold-const.h" before
-              #include "tree-scalar-evolution.h"
-    Also removed direct #include "tree-data-ref.h" (not needed by
-    the pass — it was pulled in transitively).
-
-  Fix 3 — 'g' not declared (gcc::context):
-    Added:  #include "context.h"  to riscv.cc
-    Reason: The global variable 'g' (of type gcc::context *) is
-            declared in context.h and required by register_pass().
-
-  Final include order in riscv-attn-detect.cc (relevant section):
-    #include "fold-const.h"            <- MUST come before tree-scalar-evolution
-    #include "tree-scalar-evolution.h"
-    #include "cfganal.h"
-    #include "cfghooks.h"              <- for redirect_edge_and_branch
-
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
- [STEP 16]  Build with GIMPLE Pass — Verified!
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-  Build command:
-  $ cd ~/dc/riscv-gnu-toolchain
-  $ mkdir -p build && cd build
-  $ ../configure --prefix=$HOME/riscv --with-arch=rv64gc --with-abi=lp64d
-  $ make -j$(nproc)
-
-  Build stages completed:
-    [OK] stamps/build-binutils-newlib     — assembler + objdump
-    [OK] stamps/build-gcc-newlib-stage1   — GCC stage 1 (with GIMPLE pass)
-    [OK] stamps/build-gcc-newlib-stage2   — GCC stage 2
-
-  Installed to: $HOME/riscv/bin/
-    riscv64-unknown-elf-gcc      (GCC 15.2.0 with attn builtin + GIMPLE pass)
-    riscv64-unknown-elf-as       (assembler recognizes "attn")
-    riscv64-unknown-elf-objdump  (objdump disassembles "attn")
-
-  The GIMPLE pass (riscv_attn_detect) is now compiled into cc1 and
-  registered in the optimization pipeline after the loop pass.
-
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
- ADDITIONAL FILES MODIFIED / CREATED (File 7)
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-  New file in GCC submodule:
-   22. gcc/gcc/config/riscv/riscv-attn-detect.cc  — GIMPLE idiom pass
-
-  Modified in GCC submodule:
-   23. gcc/gcc/config/riscv/t-riscv     — EXTRA_OBJS += riscv-attn-detect.o
-   24. gcc/gcc/config/riscv/riscv.cc    — #include "context.h" + extern + register_pass
-   25. gcc/gcc/Makefile.in              — compilation rule for .cc → .o
-
-  Source patches (reference copies in custom_attn/src/):
-   26. riscv-attn-detect.cc             — the pass itself
-
-
-╔══════════════════════════════════════════════════════════════╗
-║                         END OF LOG                          ║
-╚══════════════════════════════════════════════════════════════╝
+═══════════════════════════════════════════════════════════════
+  RISC-V Custom `attn` Instruction — Implementation Log
+═══════════════════════════════════════════════════════════════
+
+Project: Custom RISC-V instruction for Transformer attention
+Instruction: attn rd, rs1, rs2
+Operation: Attention(Q, K, V) = softmax(Q × K^T / √d_k) × V
+Encoding: R-type, opcode 0x0b (custom-0), funct7=0x01
+  MATCH_ATTN = 0x0200000b
+  MASK_ATTN  = 0xfe00707f
+
+Toolchain: riscv-gnu-toolchain (GCC 15.2.0, binutils)
+Target: riscv64-unknown-elf
+Build: ~/riscv/bin/riscv64-unknown-elf-gcc
+
+
+═══════════════════════════════════════════════════════════════
+  FILES MODIFIED — Explicit Builtin Path (Files 1–6)
+═══════════════════════════════════════════════════════════════
+
+File 1: binutils/include/opcode/riscv-opc.h
+  — Added MATCH_ATTN / MASK_ATTN encoding macros
+
+File 2: binutils/opcodes/riscv-opc.c
+  — Added opcode table entry for "attn" instruction
+
+File 3: gcc/gcc/config/riscv/riscv-ftypes.def
+  — Added function type: RISCV_ATYPE_UL(UL, UL)
+
+File 4: gcc/gcc/config/riscv/riscv-builtins.cc
+  — Registered __builtin_riscv_attn(unsigned long, unsigned long)
+
+File 5: gcc/gcc/config/riscv/riscv.md
+  — Added machine description pattern: (define_insn "riscv_attn" ...)
+
+File 6: riscv-opcodes/extensions/rv_custom
+  — Registered instruction in official opcode database
+
+
+═══════════════════════════════════════════════════════════════
+  FILES MODIFIED — GIMPLE Auto-Detection Pass (File 7)
+═══════════════════════════════════════════════════════════════
+
+The GIMPLE pass automatically detects the 4-stage attention
+pattern in plain C loops and replaces it with the hardware
+instruction — no explicit builtin call required.
+
+File 7a: gcc/gcc/config/riscv/riscv-attn-detect.cc  [NEW]
+  — Complete GIMPLE optimization pass (~1200 lines)
+  — Pattern detection: matmul → scale → softmax → matmul
+  — Pattern replacement: emits __builtin_riscv_attn() call
+  — Registered as pass #366 in the GCC pipeline (after "loop")
+
+File 7b: gcc/gcc/config/riscv/t-riscv  [MODIFIED]
+  — Added: EXTRA_OBJS += riscv-attn-detect.o
+
+File 7c: gcc/gcc/Makefile.in  [MODIFIED]
+  — Added compilation rule for riscv-attn-detect.cc → .o
+
+File 7d: gcc/gcc/config/riscv/riscv.cc  [MODIFIED]
+  — Added: #include "context.h"
+  — Added: extern gimple_opt_pass *make_pass_riscv_attn_detect(gcc::context *);
+  — Added: register_pass() call inside riscv_option_override()
+    with reference_pass_name="loop", PASS_POS_INSERT_AFTER
+
+
+═══════════════════════════════════════════════════════════════
+  GIMPLE PASS — Technical Details & Fixes Applied
+═══════════════════════════════════════════════════════════════
+
+The pass (riscv_attn_detect) runs after loop optimization and
+performs the following:
+
+1. DETECTION PHASE
+   — Collects top-level loops from the function's loop tree
+   — Reverses loop order (GCC lists children in reverse program order)
+   — Slides a window of 4 consecutive loops, checking:
+     Stage 1: is_matmul_pattern()     — triple-nested, MULT+PLUS reduction
+     Stage 2: is_elementwise_div()    — double-nested, MULT by 1/sqrt(d)
+     Stage 3: is_softmax_pattern()    — outer loop with 2-3 child loops
+                                        (exp+sum and normalize)
+     Stage 4: is_matmul_pattern()     — triple-nested, same as Stage 1
+
+2. REPLACEMENT PHASE
+   — Extracts function parameters (n, d, Q, K, V)
+   — Builds stack structs: dims{n,n,n,d} and qkv{Q,K,V}
+   — Emits __builtin_riscv_attn(&dims, &qkv) call
+   — Redirects control flow to skip original loops
+   — Dead code elimination (DCE) cleans up unreachable loop bodies
+
+Fixes applied during integration with GCC 15.2.0:
+
+  FIX 1: TARGET_MEM_REF (tree code 166) vs MEM_REF (167)
+    GCC 15 uses TARGET_MEM_REF for pointer-based memory accesses.
+    Added TARGET_MEM_REF checks alongside MEM_REF in:
+    — find_matmul_reduction() for array operand extraction
+    — is_elementwise_div() for scale array detection
+    — strip_to_decl() for base pointer tracing
+    — is_matmul_pattern() store target scanning
+
+  FIX 2: PLUS_EXPR operand ordering
+    GCC may place the MULT_EXPR result in either rhs1 or rhs2
+    of the accumulation PLUS_EXPR. Added checks for both positions.
+
+  FIX 3: Loop ordering (reverse program order)
+    GCC's loop tree lists child loops in reverse program order.
+    Added reversal of top_loops vector before pattern matching.
+    Guard: skip reversal when top_loops.length() <= 1 to prevent
+    unsigned underflow.
+
+  FIX 4: Softmax 2-child support
+    Simple softmax (without max-reduction for numerical stability)
+    produces only 2 child loops (exp+sum and normalize), not 3.
+    Added auto-detection of which child has exp() calls to handle
+    both orderings.
+
+  FIX 5: Store target extraction
+    The matmul accumulator (sum SSA) is in the innermost loop, but
+    the actual store to the score array is in the middle loop.
+    Added scanning of the middle loop for memory stores.
+
+  FIX 6: Function parameter extraction for replacement
+    SSA base pointers from pattern matching are deep in address
+    arithmetic chains. Replacement uses DECL_ARGUMENTS to get
+    the original function parameters (n, d, Q, K, V) directly.
+
+  FIX 7: Header dependencies
+    — Added #include "cfghooks.h" for redirect_edge_and_branch()
+    — Removed #include "tree-data-ref.h" (unused, caused ordering issues)
+    — Moved #include "fold-const.h" before tree-scalar-evolution.h
+    — Added #include "context.h" to riscv.cc for gcc::context
+
+
+═══════════════════════════════════════════════════════════════
+  BUILD & CONFIGURE
+═══════════════════════════════════════════════════════════════
+
+  cd ~/dc/riscv-gnu-toolchain
+  mkdir -p build && cd build
+  ../configure --prefix=$HOME/riscv --with-arch=rv64gc --with-abi=lp64d
+  make -j$(nproc)
+
+  export PATH=$HOME/riscv/bin:$PATH
+  riscv64-unknown-elf-gcc --version
+  # riscv64-unknown-elf-gcc (g5115c7e447f-dirty) 15.2.0
+
+
+═══════════════════════════════════════════════════════════════
+  VERIFICATION
+═══════════════════════════════════════════════════════════════
+
+Test 1: Explicit builtin (mainbuiltin.c)
+  $ riscv64-unknown-elf-gcc -O2 -march=rv64gc -mabi=lp64d \
+      -ffreestanding -nostdlib -c mainbuiltin.c -o mainbuiltin.o
+  $ riscv64-unknown-elf-objdump -d mainbuiltin.o
+
+  Expected disassembly:
+    0:   02b5050b    attn    a0,a0,a1
+    4:   8082        ret
+
+Test 2: Auto-detected C loops (mainloops.c)
+  $ riscv64-unknown-elf-gcc -O2 -march=rv64gc -mabi=lp64d \
+      -ffreestanding -nostdlib -c mainloops.c -o mainloops.o
+  $ riscv64-unknown-elf-objdump -d mainloops.o
+
+  Expected: 'attn a0,a0,a1' appears in the attention() function
+  instead of nested loop assembly.
+
+Test 3: GIMPLE pass dump verification
+  $ riscv64-unknown-elf-gcc -O2 -march=rv64gc -mabi=lp64d \
+      -ffreestanding -nostdlib -c mainloops.c -o mainloops.o \
+      -fdump-tree-all-details
+  $ grep "ATTENTION PATTERN DETECTED" mainloops.c.366t.riscv_attn_detect
+
+  Expected output:
+    *** ATTENTION PATTERN DETECTED ***
+    Loops: 1 (matmul1) → 2 (scale) → 3 (softmax) → 4 (matmul2)
+
+
+═══════════════════════════════════════════════════════════════
+  SUMMARY
+═══════════════════════════════════════════════════════════════
+
+Two paths to the attn instruction:
+
+  Path A: __builtin_riscv_attn(dims, qkv)
+    → Direct, explicit. Works in all cases.
+
+  Path B: Write plain C loops matching the attention pattern
+    → Compiler auto-detects and replaces with attn instruction.
+    → Requires: 4 separate stages (matmul, scale, softmax, matmul)
+    → -O2 optimization level required for the pass to run.
+
+Both paths produce identical machine code: attn rd, rs1, rs2
+(encoding 0x02b5050b).

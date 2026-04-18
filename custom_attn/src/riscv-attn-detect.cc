@@ -991,6 +991,19 @@ if (!arrays_share_base (score_base_1, matmul2_a))
                      cand->exit_bb ? cand->exit_bb->index : -1);
         }
 
+      /* Bail out if we could not extract loop trip counts —
+         without seq_len and d_model the replacement phase cannot
+         build the dims struct correctly.  */
+      if (!cand->seq_len || !cand->d_model)
+        {
+          if (dump_file)
+            fprintf (dump_file, "  Cannot extract loop trip counts "
+                     "(seq_len=%s, d_model=%s) — skipping replacement\n",
+                     cand->seq_len ? "OK" : "NULL",
+                     cand->d_model ? "OK" : "NULL");
+          continue;   /* try next window of 4 loops  */
+        }
+
       detected = true;
       break;
     }

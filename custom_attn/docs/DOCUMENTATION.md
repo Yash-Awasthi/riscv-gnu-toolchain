@@ -1,34 +1,58 @@
 # RISC-V Custom Instruction — Complete Documentation
 ### Everything You Need to Know (Group 9 — Attention Mechanism)
 
+This document is a sequential guide. Read it top to bottom. Every concept is explained when it first appears, so you should never need to scroll back.
+
 ---
 
 ## Table of Contents
 
+**Part 1 — Foundations**
 1. [What is RISC-V?](#1-what-is-risc-v)
 2. [What is a Custom Instruction?](#2-what-is-a-custom-instruction)
 3. [What is the GNU Toolchain?](#3-what-is-the-gnu-toolchain)
 4. [How a C Program Becomes Machine Code](#4-how-a-c-program-becomes-machine-code)
 5. [Understanding Opcodes — The Language of the CPU](#5-understanding-opcodes--the-language-of-the-cpu)
 6. [RISC-V Instruction Formats](#6-risc-v-instruction-formats)
+
+**Part 2 — Designing Our Instruction**
 7. [The custom-0 Through custom-3 Opcode Slots](#7-the-custom-0-through-custom-3-opcode-slots)
 8. [How to Find a Free Opcode — Step by Step](#8-how-to-find-a-free-opcode--step-by-step)
-9. [MATCH and MASK — How the CPU Identifies Instructions](#9-match-and-mask--how-the-cpu-identifies-instructions)
-10. [Our Instruction: attn](#10-our-instruction-attn)
-11. [File 1 — riscv-opc.h (The Encoding Registry)](#11-file-1--riscv-opch-the-encoding-registry)
-12. [File 2 — riscv-opc.c (The Assembler's Lookup Table)](#12-file-2--riscv-opcc-the-assemblers-lookup-table)
-13. [File 3 — riscv-ftypes.def (Function Type Signature)](#13-file-3--riscv-ftypesdef-function-type-signature)
-14. [File 4 — riscv-builtins.cc (Builtin Registration)](#14-file-4--riscv-builtinscc-builtin-registration)
-15. [File 5 — riscv.md (Machine Description)](#15-file-5--riscvmd-machine-description)
+9. [Our Instruction: attn](#9-our-instruction-attn)
+
+**Part 3 — Layer 1: Teaching the Toolchain (Files 1–6)**
+10. [File 1 — riscv-opc.h (The Encoding Registry)](#10-file-1--riscv-opch-the-encoding-registry)
+11. [File 2 — riscv-opc.c (The Assembler's Lookup Table)](#11-file-2--riscv-opcc-the-assemblers-lookup-table)
+12. [File 3 — riscv-ftypes.def (Function Type Signature)](#12-file-3--riscv-ftypesdef-function-type-signature)
+13. [File 4 — riscv-builtins.cc (Builtin Registration)](#13-file-4--riscv-builtinscc-builtin-registration)
+14. [File 5 — riscv.md (Machine Description)](#14-file-5--riscvmd-machine-description)
+15. [File 6 — rv_custom (Opcode Registry)](#15-file-6--rv_custom-opcode-registry)
+
+**Part 4 — Building and Verifying the Builtin**
 16. [Building the Toolchain — Every Command Explained](#16-building-the-toolchain--every-command-explained)
 17. [The Demo C Program — Line by Line](#17-the-demo-c-program--line-by-line)
 18. [Compiling and Verifying — Every Command Explained](#18-compiling-and-verifying--every-command-explained)
 19. [Reading the objdump Output](#19-reading-the-objdump-output)
-20. [The Automation Script — How It Works](#20-the-automation-script--how-it-works)
-21. [R4-Type — 3-Input Instructions](#21-r4-type--3-input-instructions)
-22. [Viva Questions and Answers](#22-viva-questions-and-answers)
+
+**Part 5 — Layer 2: Automatic Detection (GIMPLE Pass)**
+20. [What is GIMPLE?](#20-what-is-gimple)
+21. [GCC's Optimization Pipeline](#21-gccs-optimization-pipeline)
+22. [What is a Compiler Pass?](#22-what-is-a-compiler-pass)
+23. [Our GIMPLE Pass — The Big Picture](#23-our-gimple-pass--the-big-picture)
+24. [Detection Phase — How the Pass Reads Loops](#24-detection-phase--how-the-pass-reads-loops)
+25. [Replacement Phase — How the Pass Emits the Instruction](#25-replacement-phase--how-the-pass-emits-the-instruction)
+26. [Integrating the Pass into GCC](#26-integrating-the-pass-into-gcc)
+27. [Verifying Auto-Detection](#27-verifying-auto-detection)
+28. [The 11 Fixes — What Went Wrong and Why](#28-the-11-fixes--what-went-wrong-and-why)
+
+**Part 6 — Extras**
+29. [R4-Type — 3-Input Instructions](#29-r4-type--3-input-instructions)
+30. [The Automation Script — How It Works](#30-the-automation-script--how-it-works)
+31. [Quick Reference Card](#31-quick-reference-card)
 
 ---
+
+# Part 1 — Foundations
 
 ## 1. What is RISC-V?
 
@@ -42,11 +66,9 @@ Unlike x86 (owned by Intel/AMD) or ARM (owned by ARM Holdings), RISC-V is **free
 - There are few instruction formats (R, I, S, B, U, J)
 - The CPU hardware is simpler and faster
 
-**RV64IMAC** — this is the specific RISC-V configuration we target:
+**RV64GC** — this is the specific RISC-V configuration we target:
 - **RV64** = 64-bit base integer ISA (registers are 64 bits wide)
-- **I** = Base integer instructions (add, sub, load, store, branch)
-- **M** = Multiply/divide extension
-- **A** = Atomic operations extension
+- **G** = General-purpose (shorthand for IMAFD — Integer, Multiply, Atomic, Float, Double)
 - **C** = Compressed instructions extension (16-bit short forms of common instructions)
 
 ---
@@ -68,7 +90,7 @@ output = softmax(Q × Kᵀ / √dₖ) × V
 
 This is the core operation of the Transformer architecture used in models like GPT and BERT.
 
-In a real chip, this instruction would trigger a hardware accelerator. In our project, we are proving that the **toolchain** (compiler + assembler + disassembler) can handle the instruction. The hardware implementation would be a separate project.
+In a real chip, this instruction would trigger a hardware accelerator. In our project, we are proving that the **toolchain** (compiler + assembler + disassembler) can handle the instruction — and that the compiler can **automatically detect** the attention pattern in plain C code and replace it with the hardware instruction. The hardware implementation would be a separate project.
 
 ---
 
@@ -95,38 +117,41 @@ This is a **cross-compiler** — it runs on your x86 laptop but produces RISC-V 
 
 ## 4. How a C Program Becomes Machine Code
 
-Here is the complete pipeline:
+Here is the complete pipeline. Understanding this is critical because every file we modify is part of this chain:
 
 ```
 main.c (C source code)
     │
-    │  GCC compiler
-    │  Recognizes __builtin_riscv_attn()
-    │  Looks up the machine description (riscv.md)
-    │  Generates: "attn a0,a0,a1" assembly text
+    │  GCC compiler (what we modify in Part 3, files 3-5)
+    │  1. Preprocesses: expands #includes and macros
+    │  2. Parses: builds an Abstract Syntax Tree (AST)
+    │  3. Converts to GIMPLE: GCC's internal representation (Part 5)
+    │  4. Optimizes: runs optimization passes (our GIMPLE pass lives here)
+    │  5. Converts to RTL: Register Transfer Language
+    │  6. Emits assembly: "attn a0,a0,a1"
     │
     ▼
 main.s (assembly source)
     │
-    │  GAS assembler (part of binutils)
-    │  Reads riscv-opc.c opcode table
-    │  Finds "attn" → MATCH_ATTN = 0x0000000b
+    │  GAS assembler (what we modify in Part 3, files 1-2)
+    │  Reads the opcode table (riscv-opc.c)
+    │  Finds "attn" → MATCH_ATTN = 0x0200000b
     │  Encodes registers into the 32-bit instruction
-    │  Outputs binary: 0x00b5050b
     │
     ▼
 main.o (object file — raw machine code)
     │
-    │  objdump (part of binutils)
-    │  Reads the binary, uses riscv-opc.c + riscv-opc.h
-    │  Recognizes 0x00b5050b as "attn a0,a0,a1"
-    │  Displays human-readable disassembly
+    │  objdump (uses our modifications to files 1-2)
+    │  Reads the binary, matches against MATCH/MASK
+    │  Recognizes 0x02b5050b as "attn a0,a0,a1"
     │
     ▼
 Disassembly output (what we see in the terminal)
 ```
 
-Every file we modify is part of this pipeline. That is why we need to touch both binutils (for the assembler and disassembler) and GCC (for the compiler).
+Notice the two separate flows:
+- **Encoding path** (C → assembly → binary): needs GCC (files 3-5) + GAS (files 1-2)
+- **Decoding path** (binary → readable text): needs objdump (files 1-2)
 
 ---
 
@@ -178,7 +203,7 @@ Each register number is 5 bits (because 2⁵ = 32 registers). So `a0` = register
 
 ## 6. RISC-V Instruction Formats
 
-RISC-V defines 6 standard instruction formats. We use **R-type** for 2-input instructions and **R4-type** for 3-input instructions.
+RISC-V defines 6 standard instruction formats. We use **R-type** for our 2-input instruction.
 
 ### R-type (Register-Register) — Used for `attn`
 
@@ -192,19 +217,9 @@ RISC-V defines 6 standard instruction formats. We use **R-type** for 2-input ins
 
 R-type is used when an instruction takes two source registers and produces one result. Examples: `add`, `sub`, `and`, `or`, and our `attn`.
 
-### R4-type (Four-Register) — Used for 3-input custom instructions
-
-```
-31    27 26 25 24    20 19    15 14  12 11     7 6      0
-┌────────┬─────┬──────┬────────┬──────┬────────┬────────┐
-│  rs3   │ f2  │ rs2  │  rs1   │funct3│   rd   │ opcode │
-└────────┴─────┴──────┴────────┴──────┴────────┴────────┘
-  5 bits  2 bits 5 bits 5 bits  3 bits  5 bits   7 bits  = 32 bits
-```
-
-R4-type is used when an instruction takes three source registers. The funct7 field is split into rs3 (5 bits) + funct2 (2 bits). Used for fused multiply-add operations like `fmadd`.
-
 ---
+
+# Part 2 — Designing Our Instruction
 
 ## 7. The custom-0 Through custom-3 Opcode Slots
 
@@ -225,7 +240,7 @@ Within each slot, you can use different `funct3` and `funct7` values to create m
 - Total: 8 × 128 = **1,024 different instructions per custom slot**
 - Across all 4 slots: **4,096 possible custom instructions**
 
-Our `attn` instruction uses: custom-0, funct3=0, funct7=0. That is the very first slot.
+Our `attn` instruction uses: custom-0, funct3=0, funct7=1 (0x01). We use funct7=1 (not 0) because funct7=0 was already taken by an earlier test instruction.
 
 ---
 
@@ -249,17 +264,15 @@ This repository is maintained by the RISC-V foundation. It contains machine-read
 grep -o "6..2=0x[0-9A-Fa-f]*" -R extensions/ | sed 's/.*=0x//' | awk '{printf "0x%02x\n", strtonum("0x"$1)}' | sort -u > used_clean.txt
 ```
 
-What each part of this command does:
+What each part does:
 
 | Part | What it does |
 |------|-------------|
-| `grep -o "6..2=0x[0-9A-Fa-f]*" -R extensions/` | Searches all files in `extensions/` recursively (`-R`) for the pattern `6..2=0xNN`. In riscv-opcodes format, `6..2=0x02` means "bits 6 down to 2 of the opcode field equal 0x02". The `-o` flag prints only the matching part, not the whole line. |
-| `sed 's/.*=0x//'` | Strips everything before and including `=0x`, leaving just the hex value (e.g., `02`). `sed` is a stream editor — `s/pattern/replacement/` means substitute. |
-| `awk '{printf "0x%02x\n", strtonum("0x"$1)}'` | Formats each value as a proper hex number like `0x02`. `strtonum` converts the string to a number, `%02x` formats it as 2-digit lowercase hex. |
-| `sort -u` | Sorts the list and removes duplicates (`-u` = unique). |
-| `> used_clean.txt` | Saves the output to a file. |
-
-The output `used_clean.txt` contains every opcode value (bits [6:2]) that is already claimed by some extension.
+| `grep -o "6..2=0x[0-9A-Fa-f]*" -R extensions/` | Searches all files for the pattern `6..2=0xNN` (the riscv-opcodes format for opcode bits). `-R` = recursive, `-o` = only print matching part. |
+| `sed 's/.*=0x//'` | Strips everything before the hex value. `sed` is a stream editor. |
+| `awk '{printf "0x%02x\n", strtonum("0x"$1)}'` | Formats each value as proper hex like `0x02`. |
+| `sort -u` | Sorts and removes duplicates. |
+| `> used_clean.txt` | Saves to file. |
 
 ### Step 8.3 — Generate all possible opcode values
 
@@ -267,7 +280,7 @@ The output `used_clean.txt` contains every opcode value (bits [6:2]) that is alr
 for i in $(seq 0 31); do printf "0x%02x\n" $i; done > all_clean.txt
 ```
 
-Bits [6:2] are 5 bits, so there are 2^5 = 32 possible values (0 through 31). This command generates all of them. `seq 0 31` produces numbers 0 to 31, and `printf "0x%02x\n"` formats each one as hex.
+Bits [6:2] are 5 bits, so there are 2⁵ = 32 possible values. This generates all of them.
 
 ### Step 8.4 — Find which opcodes are free
 
@@ -276,282 +289,43 @@ comm -23 all_clean.txt used_clean.txt > free_from_extensions.txt
 cat free_from_extensions.txt
 ```
 
-`comm` compares two sorted files line by line. The flags `-23` suppress columns 2 and 3, showing only lines unique to the first file (i.e., opcodes that exist in `all_clean.txt` but NOT in `used_clean.txt`). These are the free slots.
+`comm` compares two sorted files. `-23` shows lines only in the first file — opcodes that are NOT used.
 
-### Step 8.5 — Cross-check against binutils
+### Step 8.5 — Computing MATCH and MASK
 
-The riscv-opcodes repo might not have every vendor extension. To be extra safe, also check what the assembler already knows about:
+Now we have the opcode (`0x0B` = custom-0). We choose funct3=0 and funct7=1. These three values uniquely identify our instruction.
 
-```
-grep -oP '"[A-Z_]+",\s*0x\K[0-9a-fA-F]+' ~/dc/riscv-gnu-toolchain/binutils/gas/config/tc-riscv.c | awk '{printf "0x%02x\n", strtonum("0x"$1)}' | sort -u > used_binutils.txt
-comm -23 free_from_extensions.txt used_binutils.txt
-```
-
-| Part | What it does |
-|------|-------------|
-| `grep -oP '"[A-Z_]+",\s*0x\K[0-9a-fA-F]+'` | Searches `tc-riscv.c` (the assembler's RISC-V handler) for opcode constants. `-P` enables Perl-compatible regex. `\K` resets the match start, so only the hex value after `0x` is captured. |
-| `comm -23 free_from_extensions.txt used_binutils.txt` | Shows opcodes that are free in extensions AND not used by binutils. |
-
-### Step 8.6 — Result
-
-For our project, opcode slot `0x02` (bits [6:2]) is confirmed free in both the specification and binutils. This maps to:
-
-```
-Full 7-bit opcode = (0x02 << 2) | 0x03 = 0x0B = custom-0
-```
-
-The bottom 2 bits of any standard 32-bit RISC-V opcode are always `11` (binary) = `0x3`. So the 5-bit value `0x02` becomes the 7-bit value `0x0B`.
-
-Let us work through the math carefully:
-
-**What does `bits[6:2] = 0x02` mean?**
-
-The notation `[6:2]` means "bit 6 down to bit 2" — that is 5 bits. In a 32-bit instruction, bit 0 is the rightmost bit (least significant) and bit 31 is the leftmost (most significant). So `bits[6:2]` are the 5 bits at positions 6, 5, 4, 3, 2.
-
-The full 7-bit opcode field occupies `bits[6:0]` = positions 6, 5, 4, 3, 2, 1, 0. The riscv-opcodes repo only stores `bits[6:2]` because `bits[1:0]` are always `11` for 32-bit instructions (this is defined by the RISC-V spec — it is how the CPU distinguishes 32-bit instructions from 16-bit compressed instructions).
-
-**Converting 5-bit value to 7-bit opcode:**
-
-```
-bits[6:2] = 0x02 = 00010 in binary (5 bits)
-bits[1:0] = 0x3  = 11    in binary (2 bits, always fixed)
-
-Combine: bits[6:0] = 00010 ++ 11 = 0001011 (7 bits)
-
-Convert 0001011 to hex:
-  0001011 = 0×64 + 0×32 + 0×16 + 1×8 + 0×4 + 1×2 + 1×1
-          = 8 + 2 + 1 = 11 decimal = 0x0B
-
-Shortcut formula: full_opcode = (bits_6_2 << 2) | 0x03
-                              = (0x02 << 2) | 0x03
-                              = (0x02 × 4)  | 0x03
-                              = 0x08 | 0x03
-                              = 0x0B
-```
-
-**What does `<< 2` mean?** It means "shift left by 2 bits" — equivalent to multiplying by 4. This makes room for the 2 fixed bits at positions [1:0].
-
-**What does `|` mean?** It means bitwise OR — it combines the bits. `0x08 | 0x03` = `0000_1000 | 0000_0011` = `0000_1011` = `0x0B`.
-
-For reference, all four custom slots:
-
-| Grep value [6:2] | Binary [6:2] | Append 11 | Binary [6:0] | Hex [6:0] | Name |
-|-------------------|-------------|-----------|-------------|-----------|------|
-| `0x02` | `00010` | `00010` ++ `11` | `0001011` | `0x0B` | custom-0 |
-| `0x0A` | `01010` | `01010` ++ `11` | `0101011` | `0x2B` | custom-1 |
-| `0x16` | `10110` | `10110` ++ `11` | `1011011` | `0x5B` | custom-2 |
-| `0x1E` | `11110` | `11110` ++ `11` | `1111011` | `0x7B` | custom-3 |
-
-### Step 8.7 — Computing MATCH: The Instruction's Bit Fingerprint
-
-Now we have the opcode (`0x0B`). We also choose funct3 and funct7 — we pick `0` for both (first available slot). Together, these three values uniquely identify our instruction.
-
-MATCH is a 32-bit number where we put the opcode, funct3, and funct7 in their correct bit positions, and set all register fields to zero.
-
-The R-type instruction layout (for reference):
-
-```
-Bit:    31       25 24    20 19    15 14  12 11     7 6      0
-Field:  funct7      rs2      rs1     funct3   rd      opcode
-Ours:   0000000    00000    00000     000    00000   0001011
-```
+**MATCH** is a 32-bit number with opcode, funct3, and funct7 in their correct bit positions, and all register fields set to zero:
 
 ```
 MATCH = opcode | (funct3 << 12) | (funct7 << 25)
+      = 0x0B   | (0 << 12)      | (1 << 25)
+      = 0x0B   | 0x00000000     | 0x02000000
+      = 0x0200000B
 ```
 
-What does `<< 12` mean? It shifts the value left by 12 bit positions. funct3 occupies bits [14:12], so its value needs to be shifted left by 12 to land in the right position.
+What does `<< 25` mean? It shifts bits left by 25 positions. funct7 occupies bits [31:25], so its value needs to land at bit position 25.
 
-What does `<< 25` mean? funct7 occupies bits [31:25], so its value needs to be shifted left by 25.
-
-Working it out:
+**MASK** tells the CPU which bits identify this instruction (1 = matters, 0 = ignore):
 
 ```
-opcode = 0x0B = 0000_0000_0000_0000_0000_0000_0000_1011
-                                                 ^^^^^^^ bits [6:0]
+funct7 [31:25] = 1111111  (these identify the instruction)
+rs2    [24:20] = 00000    (these vary per usage)
+rs1    [19:15] = 00000    (these vary per usage)
+funct3 [14:12] = 111      (these identify the instruction)
+rd     [11:7]  = 00000    (these vary per usage)
+opcode [6:0]   = 1111111  (these identify the instruction)
 
-funct3 << 12 = 0x0 << 12 = 0
-  (0 shifted by any amount is still 0)
-
-funct7 << 25 = 0x00 << 25 = 0
-  (0 shifted by any amount is still 0)
-
-MATCH = 0x0000000B | 0x00000000 | 0x00000000 = 0x0000000B
-```
-
-**Example with non-zero funct7:** If we picked funct7 = 1 for a second instruction:
-
-```
-funct7 << 25 = 1 << 25 = 0x02000000
-
-In binary: 0000_0010_0000_0000_0000_0000_0000_0000
-                ^^                                   bit 25 is set
-
-MATCH = 0x0000000B | 0x00000000 | 0x02000000 = 0x0200000B
-```
-
-### Step 8.8 — Computing MASK: Which Bits Identify This Instruction
-
-MASK is a 32-bit number where every bit that is part of an "identifying field" (opcode, funct3, funct7) is set to `1`, and every bit that is part of a "variable field" (rd, rs1, rs2) is set to `0`.
-
-```
-Build it field by field:
-
-opcode [6:0]   = 7 bits  → 1111111  (these identify the instruction)
-rd     [11:7]  = 5 bits  → 00000    (these vary per usage)
-funct3 [14:12] = 3 bits  → 111      (these identify the instruction)
-rs1    [19:15] = 5 bits  → 00000    (these vary per usage)
-rs2    [24:20] = 5 bits  → 00000    (these vary per usage)
-funct7 [31:25] = 7 bits  → 1111111  (these identify the instruction)
-
-Concatenate from bit 31 down to bit 0:
-  1111111 00000 00000 111 00000 1111111
-
-Group into nibbles (4 bits each, from the right):
-  1111 1110 0000 0000 0111 0000 0111 1111
-  F    E    0    0    7    0    7    F
-
+Concatenate: 1111111_00000_00000_111_00000_1111111
+Group into hex nibbles: FE 00 70 7F
 MASK = 0xFE00707F
 ```
 
-**Let us verify the nibble conversion step by step:**
-
-```
-Binary:  1111  1110  0000  0000  0111  0000  0111  1111
-Hex:       F     E     0     0     7     0     7     F
-
-How to convert each nibble:
-  1111 = 8+4+2+1 = 15 = F
-  1110 = 8+4+2+0 = 14 = E
-  0000 = 0
-  0111 = 4+2+1   = 7
-  1111 = 15 = F
-```
-
-**Sanity check:** Count the 1-bits in the MASK:
-- opcode contributes 7 ones
-- funct3 contributes 3 ones
-- funct7 contributes 7 ones
-- Total: 17 ones, 15 zeros (from rd + rs1 + rs2 = 5+5+5). Correct.
-
-### Step 8.9 — Verification: The Full Check
-
-Our compiled instruction from objdump is `0x00B5050B` (which decodes to `attn a0, a0, a1`).
-
-The identification check: `(instruction & MASK) == MATCH`
-
-```
-instruction = 0x00B5050B
-MASK        = 0xFE00707F
-
-Step 1: AND them together (bit by bit, 1&1=1, anything else=0):
-
-  0000_0000_1011_0101_0000_0101_0000_1011   (0x00B5050B)
-& 1111_1110_0000_0000_0111_0000_0111_1111   (0xFE00707F)
-= 0000_0000_0000_0000_0000_0000_0000_1011   (0x0000000B)
-
-Step 2: Compare with MATCH:
-  0x0000000B == 0x0000000B  ✓  This IS the attn instruction!
-```
-
-Now extract the register values from the variable fields:
-
-```
-Full binary of 0x00B5050B:
-  0000_0000_1011_0101_0000_0101_0000_1011
-
-funct7 = bits[31:25] = 0000000 = 0         ← part of instruction identity
-rs2    = bits[24:20] = 01011   = 11 = x11 = a1   ← second source register
-rs1    = bits[19:15] = 01010   = 10 = x10 = a0   ← first source register
-funct3 = bits[14:12] = 000     = 0         ← part of instruction identity
-rd     = bits[11:7]  = 01010   = 10 = x10 = a0   ← destination register
-opcode = bits[6:0]   = 0001011 = 0x0B      ← part of instruction identity
-
-Register number to name: x10 = a0, x11 = a1  (RISC-V ABI naming)
-Result: attn a0, a0, a1  ✓  (matches objdump output exactly)
-```
-
-This is exactly what the automation script does — it scans for the first unused funct3/funct7 combination and computes MATCH and MASK automatically.
+**Verification:** `(instruction & MASK) == MATCH` tells the CPU "this is the `attn` instruction."
 
 ---
 
-## 9. MATCH and MASK — How the CPU Identifies Instructions
-
-When the CPU (or the disassembler) reads a 32-bit instruction from memory, it needs to figure out which instruction it is. It does this using **MATCH** and **MASK** values.
-
-### MASK — "Which bits do I care about?"
-
-The MASK tells you which bits of the 32-bit instruction are significant for identification. A `1` in the mask means "this bit matters", a `0` means "ignore this bit".
-
-For R-type instructions:
-
-```
-MASK = 0xFE00707F
-
-Binary: 1111_1110_0000_0000_0111_0000_0111_1111
-         ^^^^^^^^                 ^^^      ^^^^^^^
-         funct7                  funct3    opcode
-         (7 bits matter)         (3 bits)  (7 bits)
-
-Bits that are 0 in the mask (ignored):
-         rs2 (bits 24-20), rs1 (bits 19-15), rd (bits 11-7)
-```
-
-This makes sense — the register fields change depending on which registers you use, but the instruction identity stays the same.
-
-### MATCH — "What should those bits be?"
-
-The MATCH value is the actual bit pattern that must appear in the "cared about" positions.
-
-For `attn`:
-
-```
-MATCH = 0x0000000B
-
-Binary: 0000_0000_0000_0000_0000_0000_0000_1011
-        ^^^^^^^^                 ^^^      ^^^^^^^
-        funct7=0x00             funct3=0  opcode=0x0B
-```
-
-### How identification works
-
-```
-instruction_from_memory & MASK == MATCH
-```
-
-If this is true, the instruction is `attn`. Let us verify with the actual binary we saw in objdump:
-
-```
-Encoded instruction: 0x00B5050B
-
-0x00B5050B & 0xFE00707F = ?
-
-  0000_0000_1011_0101_0000_0101_0000_1011   (0x00B5050B)
-& 1111_1110_0000_0000_0111_0000_0111_1111   (0xFE00707F)
-= 0000_0000_0000_0000_0000_0000_0000_1011   (0x0000000B)
-
-0x0000000B == 0x0000000B ✓  →  This is the attn instruction!
-```
-
-Now let us extract the registers from that same instruction:
-
-```
-Full encoding: 0x00B5050B
-Binary: 0000_0000_1011_0101_0000_0101_0000_1011
-
-rd    = bits [11:7]  = 01010  = 10 = a0  ✓
-rs1   = bits [19:15] = 01010  = 10 = a0  ✓
-rs2   = bits [24:20] = 01011  = 11 = a1  ✓
-funct7= bits [31:25] = 0000000 = 0
-funct3= bits [14:12] = 000     = 0
-opcode= bits [6:0]   = 0001011 = 0x0B = custom-0
-```
-
-This decodes to: `attn a0, a0, a1` — exactly what objdump showed us.
-
----
-
-## 10. Our Instruction: attn
+## 9. Our Instruction: attn
 
 ### What it represents
 
@@ -562,139 +336,113 @@ Attention(Q, K, V) = softmax(Q × Kᵀ / √dₖ) × V
 ```
 
 Where:
-- **Q** (Query) — a matrix of shape [seq_len × d_k]
-- **K** (Key) — a matrix of shape [seq_len × d_k]
-- **V** (Value) — a matrix of shape [seq_len × d_v]
-- **dₖ** — the dimension of the key vectors (used for scaling)
-- **Kᵀ** — K transposed
+- **Q** (Query), **K** (Key), **V** (Value) — matrices of shape [seq_len × d_k]
+- **dₖ** — dimension of key vectors (used for scaling)
 - **softmax** — applied row-wise to normalize attention weights
 
 ### Why two pointer arguments?
 
-You cannot pass three entire matrices through CPU registers. Registers are 64 bits wide — they can hold one number. So instead, we pass **memory addresses** (pointers) to structs:
+You cannot pass three entire matrices through CPU registers. Registers are 64 bits wide — they hold one number. So we pass **memory addresses** (pointers) to structs:
 
-- `rs1` points to a struct containing the matrix dimensions (rows, columns, sequence length, model dimension)
-- `rs2` points to a struct containing three pointers to the Q, K, and V matrices in memory
+- `rs1` points to a struct containing the matrix dimensions
+- `rs2` points to a struct containing three pointers to Q, K, and V in memory
 
-A hardware accelerator connected to this CPU would read the struct, DMA the matrices from memory into its own SRAM, and compute the attention.
+A hardware accelerator would read the struct, DMA the matrices from memory, and compute the attention.
 
 ### The struct definitions
 
 ```c
 typedef struct {
-    int rows;
-    int cols;
-    int seq_len;
-    int d_model;
+    int rows;      // number of rows (sequence length)
+    int cols;      // number of columns (sequence length)
+    int seq_len;   // sequence length
+    int d_model;   // model dimension (d_k)
 } attn_dims_t;
 
 typedef struct {
-    float *Q;
-    float *K;
-    float *V;
+    float *Q;      // pointer to Query matrix
+    float *K;      // pointer to Key matrix
+    float *V;      // pointer to Value matrix
 } attn_qkv_t;
 ```
 
 ---
 
-## 11. File 1 — riscv-opc.h (The Encoding Registry)
+# Part 3 — Layer 1: Teaching the Toolchain (Files 1–6)
+
+These 6 files register the `attn` instruction encoding and the `__builtin_riscv_attn()` compiler builtin. This is automated by the script:
+
+```bash
+cd custom_attn/scripts && ./automate_instruction.sh add attn 2
+```
+
+But here we explain every file in detail so you understand what the script does.
+
+## 10. File 1 — riscv-opc.h (The Encoding Registry)
 
 **Full path:** `binutils/include/opcode/riscv-opc.h`
 
-**What this file is:** A massive header file that contains the binary encoding of every single RISC-V instruction. It is a registry — a phone book of instruction encodings. Both the assembler and the disassembler include this file.
+**What this file is:** A massive header file containing the binary encoding of every RISC-V instruction. Both the assembler and the disassembler include this file.
 
 **What we added:**
 
-```
-#define MATCH_ATTN  0x0000000b
+```c
+#define MATCH_ATTN  0x0200000b
 #define MASK_ATTN   0xfe00707f
 ```
 
-These two lines define the binary identity of our instruction (explained in detail in section 8).
+These define the binary identity of our instruction (section 8.5 explained the math).
 
-```
+```c
 DECLARE_INSN(attn, MATCH_ATTN, MASK_ATTN)
 ```
 
-This is a macro that registers the instruction in a table. The macro expands differently depending on context — sometimes it generates code for the assembler, sometimes for the disassembler, sometimes for validation. That is why the file has an `#ifdef DECLARE_INSN` section.
+This macro registers the instruction in a table. It expands differently depending on context — sometimes for the assembler, sometimes for the disassembler.
 
-**Why this file:** Without these definitions, neither the assembler nor the disassembler would know that the bit pattern `0x0000000b` corresponds to an instruction called `attn`.
-
-**Where exactly to add:** The `#define` lines go in the main body of the file (after line 23, `/* Instruction opcode macros. */`), inside the `#ifndef RISCV_ENCODING_H` guard. The `DECLARE_INSN` line goes in the `#ifdef DECLARE_INSN` section at the bottom of the file.
-
-**Do this:**
-
-Open `binutils/include/opcode/riscv-opc.h`. Find the line that says `/* Instruction opcode macros.  */` (line 23). Add the two `#define` lines right after it. Then scroll to the very bottom, find the `#ifdef DECLARE_INSN` block, and add the `DECLARE_INSN` line at the end of that block (before `#endif`).
+**Without these definitions**, neither the assembler nor the disassembler would know that the bit pattern `0x0200000b` corresponds to an instruction called `attn`. You would see raw hex like `0200000b` instead of the readable `attn a0,a0,a1`.
 
 ---
 
-## 12. File 2 — riscv-opc.c (The Assembler's Lookup Table)
+## 11. File 2 — riscv-opc.c (The Assembler's Lookup Table)
 
 **Full path:** `binutils/opcodes/riscv-opc.c`
 
-**What this file is:** The assembler's main lookup table. When you write `attn a0, a0, a1` in assembly, the assembler looks up "attn" in this table to find out how to encode it into binary.
+**What this file is:** The assembler's main lookup table. When you write `attn a0, a0, a1` in assembly, the assembler looks up "attn" in this table to find out how to encode it.
 
 **What we added:**
 
-```
+```c
 {"attn", 0, INSN_CLASS_I, "d,s,t", MATCH_ATTN, MASK_ATTN, match_opcode, 0},
 ```
 
-Let us break down every single field in this entry:
+Every field explained:
 
 | Field | Value | Meaning |
 |-------|-------|---------|
-| `"attn"` | — | The mnemonic. When the assembler sees this text, it matches this entry. |
-| `0` | — | Instruction length override. 0 means "use the default" (32 bits). |
-| `INSN_CLASS_I` | — | Instruction class. `I` means it belongs to the base integer ISA. It does NOT require floating-point hardware. If we used float registers, this would be `INSN_CLASS_F`. |
-| `"d,s,t"` | — | **Operand format string.** This is critical. Each letter maps to a register field: |
-| | `d` | = `rd` (destination register, bits [11:7]), integer register |
-| | `s` | = `rs1` (source register 1, bits [19:15]), integer register |
-| | `t` | = `rs2` (source register 2, bits [24:20]), integer register |
-| | `,` | = literal comma separator in the assembly syntax |
-| `MATCH_ATTN` | `0x0000000b` | The MATCH value (from riscv-opc.h) |
-| `MASK_ATTN` | `0xfe00707f` | The MASK value (from riscv-opc.h) |
-| `match_opcode` | — | A function pointer. This is the matching function the assembler uses to determine if an instruction matches this entry. `match_opcode` simply does `(insn & MASK) == MATCH`. |
-| `0` | — | Flags. 0 means no special flags. |
+| `"attn"` | — | The mnemonic text |
+| `0` | — | Instruction length override. 0 = default (32 bits) |
+| `INSN_CLASS_I` | — | Instruction class. `I` = base integer ISA. Does not require float hardware. |
+| `"d,s,t"` | — | **Operand format.** `d` = rd (destination, bits [11:7]), `s` = rs1 (source 1, bits [19:15]), `t` = rs2 (source 2, bits [24:20]) |
+| `MATCH_ATTN` | `0x0200000b` | The MATCH value from file 1 |
+| `MASK_ATTN` | `0xfe00707f` | The MASK value from file 1 |
+| `match_opcode` | — | Function that checks `(insn & MASK) == MATCH` |
+| `0` | — | No special flags |
 
-**The operand format characters:**
-
-| Char | Register Field | Type | Bits |
-|------|---------------|------|------|
-| `d` | rd | Integer | [11:7] |
-| `s` | rs1 | Integer | [19:15] |
-| `t` | rs2 | Integer | [24:20] |
-| `r` | rs3 | Integer | [31:27] (R4-type only) |
-| `D` | rd | Float | [11:7] |
-| `S` | rs1 | Float | [19:15] |
-| `T` | rs2 | Float | [24:20] |
-| `R` | rs3 | Float | [31:27] |
-
-So `"d,s,t"` means: the assembler expects `attn <integer_rd>, <integer_rs1>, <integer_rs2>`.
-
-For a 3-input instruction, you would use `"d,s,t,r"` to add integer rs3.
-
-**Why this file:** This is the bridge between the human-readable assembly (`attn a0, a0, a1`) and the binary encoding. Without this entry, writing `attn` in assembly would give you `Error: unrecognized opcode 'attn'`.
-
-**Do this:**
-
-Open `binutils/opcodes/riscv-opc.c`. Find the line `const struct riscv_opcode riscv_opcodes[] =` and the opening `{` right after it. Add the entry as the **first line** inside that array.
+**Without this entry**, writing `attn` in assembly would give: `Error: unrecognized opcode 'attn'`.
 
 ---
 
-## 13. File 3 — riscv-ftypes.def (Function Type Signature)
+## 12. File 3 — riscv-ftypes.def (Function Type Signature)
 
 **Full path:** `gcc/gcc/config/riscv/riscv-ftypes.def`
 
-**What this file is:** A definition file that creates C function type signatures that GCC builtins can use. GCC needs to know the types of arguments and return values for every builtin function.
+**What this file is:** Defines C function type signatures for GCC builtins. GCC needs to know argument and return types for every builtin.
 
 **What we added:**
 
-```
+```c
 DEF_RISCV_FTYPE (2, (DI, DI, DI))
 ```
-
-Let us break this down:
 
 | Part | Meaning |
 |------|---------|
@@ -702,113 +450,64 @@ Let us break this down:
 | `2` | Number of arguments |
 | `(DI, DI, DI)` | Type list: (return_type, arg1_type, arg2_type) |
 
-**DI** stands for **Double Integer** — a 64-bit integer. In RISC-V 64-bit, this is the size of a pointer (an `unsigned long`).
+**DI** = **Double Integer** = 64-bit integer. On RV64, this is the size of a pointer (`unsigned long`). Other type codes: `SI` = 32-bit int, `SF` = 32-bit float, `DF` = 64-bit double.
 
-Other type codes you might see:
-- `SI` = Single Integer (32 bits, like `int`)
-- `SF` = Single Float (32 bits, like `float`)
-- `DF` = Double Float (64 bits, like `double`)
-- `DI` = Double Integer (64 bits, like `unsigned long` or a pointer)
+This creates a type named `RISCV_DI_FTYPE_DI_DI` — "returns 64-bit int, takes two 64-bit int arguments."
 
-This macro creates a type named `RISCV_DI_FTYPE_DI_DI`, which means: "a function that returns DI and takes two DI arguments". The naming convention is:
-
-```
-RISCV_<return_type>_FTYPE_<arg1_type>_<arg2_type>
-```
-
-For a 3-argument function:
-
-```
-DEF_RISCV_FTYPE (3, (DI, DI, DI, DI))
-```
-
-This creates `RISCV_DI_FTYPE_DI_DI_DI`.
-
-**Why this file:** GCC is a strongly typed compiler. Before it can create a builtin function, it needs to know the exact type signature. Without this, the builtin registration in the next file would fail because the type `RISCV_DI_FTYPE_DI_DI` would not exist.
-
-**Do this:**
-
-Open `gcc/gcc/config/riscv/riscv-ftypes.def`. Scroll to the very end of the file and add the `DEF_RISCV_FTYPE` line there.
+**Without this**, the builtin registration in file 4 would fail because the type would not exist.
 
 ---
 
-## 14. File 4 — riscv-builtins.cc (Builtin Registration)
+## 13. File 4 — riscv-builtins.cc (Builtin Registration)
 
 **Full path:** `gcc/gcc/config/riscv/riscv-builtins.cc`
 
-**What this file is:** A C++ source file in GCC that registers all RISC-V builtin functions. A builtin is a function that the compiler recognizes specially — instead of generating a function call, it generates specific machine instructions directly.
+**What this file is:** Registers all RISC-V builtin functions. A **builtin** is a function the compiler recognizes specially — instead of generating a function call, it generates specific machine instructions directly.
 
-When you write `__builtin_riscv_attn(x, y)` in C, GCC does not look for a library function called `attn`. Instead, it checks its builtin table, finds the entry we added, and emits the `attn` assembly instruction directly.
+When you write `__builtin_riscv_attn(x, y)` in C, GCC does **not** look for a library function. It checks its builtin table, finds our entry, and emits the `attn` instruction directly. One C function call → one machine instruction. No overhead.
 
 **What we added — three pieces:**
 
 ### Piece 1: Type mapping
 
-```
+```c
 #define RISCV_ATYPE_DI long_integer_type_node
 ```
 
-This creates a mapping between our type code `DI` and GCC's internal type representation. `long_integer_type_node` is GCC's internal object representing the `long` type (64 bits on RV64).
-
-Other mappings already exist:
-- `RISCV_ATYPE_SI` → `intSI_type_node` (32-bit int)
-- `RISCV_ATYPE_USI` → `unsigned_intSI_type_node` (unsigned 32-bit int)
-
-We need `RISCV_ATYPE_DI` because our instruction uses 64-bit pointer-sized arguments. If this was already defined by someone else, the script skips it.
+Maps our type code `DI` to GCC's internal type object. `long_integer_type_node` is GCC's representation of the `long` type.
 
 ### Piece 2: Availability predicate
 
-```
+```c
 AVAIL (always_enabled, (!0))
 ```
 
-This defines an availability predicate called `always_enabled`. It determines whether the builtin is available to the user.
-
-The `AVAIL` macro creates a function `riscv_builtin_avail_always_enabled` that returns `(!0)`, which is C for `true`. This means our builtin is **always available**, regardless of which extensions are enabled.
-
-Other builtins might have conditions like "only available when the F (float) extension is enabled". Ours has no such restriction because we use integer registers.
+Creates a function that returns `true` (`!0`). This means our builtin is **always available**, regardless of which ISA extensions are enabled.
 
 ### Piece 3: Builtin registration
 
-```
+```c
 DIRECT_BUILTIN (attn, RISCV_DI_FTYPE_DI_DI, always_enabled),
 ```
 
-This is the actual registration. Let us break it down:
-
 | Part | Meaning |
 |------|---------|
-| `DIRECT_BUILTIN` | Macro that registers a builtin that maps directly to one instruction |
-| `attn` | The instruction name. GCC will create `__builtin_riscv_attn()` from this |
-| `RISCV_DI_FTYPE_DI_DI` | The function type (from file 3): returns DI, takes two DI args |
-| `always_enabled` | The availability predicate (from piece 2): always available |
+| `DIRECT_BUILTIN` | Maps directly to one instruction |
+| `attn` | GCC creates `__builtin_riscv_attn()` from this name |
+| `RISCV_DI_FTYPE_DI_DI` | Function type from file 3 |
+| `always_enabled` | Availability predicate from piece 2 |
 
-The `DIRECT_BUILTIN` macro does several things behind the scenes:
-1. Creates a function called `__builtin_riscv_attn`
-2. Sets its return type and argument types to match `RISCV_DI_FTYPE_DI_DI`
-3. Maps it to the RTL pattern `"riscv_attn"` (which we define in file 5)
-4. Uses the availability predicate to decide if the builtin is visible
-
-**Why `__builtin_riscv_` prefix:** GCC naming convention. All RISC-V builtins get the prefix `__builtin_riscv_`. When you register `attn`, the user-facing name becomes `__builtin_riscv_attn`.
-
-**Why this file:** This is where GCC learns that `__builtin_riscv_attn()` exists. Without this, calling `__builtin_riscv_attn()` in your C code would give: `error: implicit declaration of function '__builtin_riscv_attn'`.
-
-**Do this:**
-
-Open `gcc/gcc/config/riscv/riscv-builtins.cc`. You need to make three additions:
-1. Find `#define RISCV_ATYPE_SI intSI_type_node` and add the `RISCV_ATYPE_DI` line right after it.
-2. Find `AVAIL (hint_pause, (!0))` and add the `AVAIL (always_enabled, (!0))` line right after it.
-3. Find `#include "corev.def"` and add the `DIRECT_BUILTIN` line right after it.
+**Without this file**, calling `__builtin_riscv_attn()` would give: `error: implicit declaration of function '__builtin_riscv_attn'`.
 
 ---
 
-## 15. File 5 — riscv.md (Machine Description)
+## 14. File 5 — riscv.md (Machine Description)
 
 **Full path:** `gcc/gcc/config/riscv/riscv.md`
 
-**What this file is:** GCC's Machine Description file for RISC-V. Written in a special pattern language called **RTL** (Register Transfer Language). This file tells GCC how to convert high-level operations into actual assembly instructions.
+**What this file is:** GCC's Machine Description for RISC-V, written in **RTL** (Register Transfer Language). This tells GCC how to convert high-level operations into actual assembly instructions.
 
-Every instruction the compiler can emit has a pattern in this file. When GCC decides it needs to emit the `attn` instruction, it looks for a pattern named `"riscv_attn"` in this file.
+Every instruction the compiler can emit has a pattern here. When GCC decides to emit `attn`, it looks for the pattern named `"riscv_attn"`.
 
 **What we added — two pieces:**
 
@@ -818,20 +517,15 @@ Every instruction the compiler can emit has a pattern in this file. When GCC dec
 UNSPEC_ATTN
 ```
 
-This is added inside the `(define_c_enum "unspec" [...])` block.
+Added inside the `(define_c_enum "unspec" [...])` block.
 
-**What is UNSPEC?** GCC's RTL (internal representation) has standard operations like `plus`, `mult`, `and`, etc. But our `attn` instruction does not correspond to any standard operation. It is a completely custom operation. `UNSPEC` is GCC's way of saying "this is a special operation that GCC should not try to optimize or simplify — just emit it as-is."
+**What is UNSPEC?** GCC's internal representation has standard operations like `plus`, `mult`, `and`. But `attn` is completely custom — there is no standard operation for "compute attention." `UNSPEC` tells GCC: "this is a special operation — do not try to optimize, simplify, or reorder it. Just emit it as-is."
 
-Without `UNSPEC`, GCC might:
-- Think the operation has no side effects and remove it ("dead code elimination")
-- Try to combine it with other operations
-- Reorder it in ways that break correctness
-
-`UNSPEC_ATTN` is just a named constant (like an enum value) that uniquely identifies our custom operation.
+Without `UNSPEC`, GCC might remove our instruction entirely (thinking it has no effect) or try to combine it with other operations.
 
 ### Piece 2: Instruction pattern
 
-```
+```lisp
 (define_insn "riscv_attn"
   [(set (match_operand:DI 0 "register_operand" "=r")
         (unspec:DI [(match_operand:DI 1 "register_operand" "r")
@@ -843,303 +537,129 @@ Without `UNSPEC`, GCC might:
    (set_attr "mode" "DI")])
 ```
 
-This is dense. Let us go through every single part:
-
-**`(define_insn "riscv_attn"` ...**
-
-This defines a new instruction pattern named `"riscv_attn"`. The name must match what `DIRECT_BUILTIN` generates — for builtin name `attn`, GCC looks for pattern `"riscv_attn"`.
-
-**`[(set (match_operand:DI 0 "register_operand" "=r") ...)]`**
-
-This is the RTL pattern. It says: "This instruction SETS operand 0."
+This is dense but logical. Every part:
 
 | Part | Meaning |
 |------|---------|
-| `set` | This instruction writes a result |
-| `match_operand:DI` | Operand type is DI (64-bit integer) |
-| `0` | This is operand number 0 (the output/destination) |
-| `"register_operand"` | It must be a register (not memory, not immediate) |
-| `"=r"` | Constraint: `=` means "write-only output", `r` means "general-purpose register" |
+| `define_insn "riscv_attn"` | Defines instruction pattern named `riscv_attn` |
+| `set (match_operand:DI 0 ... "=r")` | Output: 64-bit integer in a register. `=` = write-only, `r` = general register. This is `rd`. |
+| `match_operand:DI 1 ... "r"` | Input 1: 64-bit integer register (read). This is `rs1`. |
+| `match_operand:DI 2 ... "r"` | Input 2: 64-bit integer register (read). This is `rs2`. |
+| `UNSPEC_ATTN` | Our custom operation identifier |
+| `""` | Condition: empty = always valid |
+| `"attn\t%0,%1,%2"` | Assembly template: `%0` = rd, `%1` = rs1, `%2` = rs2 |
+| `set_attr "type" "arith"` | Tells the scheduler this is an arithmetic instruction |
 
-**`(unspec:DI [(match_operand:DI 1 "register_operand" "r") (match_operand:DI 2 "register_operand" "r")] UNSPEC_ATTN)`**
+So if GCC chooses registers a0, a0, a1, the output assembly is: `attn	a0,a0,a1`
 
-| Part | Meaning |
-|------|---------|
-| `unspec:DI` | An unspecified (custom) operation producing a DI result |
-| `match_operand:DI 1 "register_operand" "r"` | Input operand 1: a DI register, constraint `r` (read) |
-| `match_operand:DI 2 "register_operand" "r"` | Input operand 2: a DI register, constraint `r` (read) |
-| `UNSPEC_ATTN` | The UNSPEC identifier we defined in piece 1 |
-
-**`""`**
-
-The condition string. An empty string `""` means "this pattern is always valid, no special conditions needed." If we wanted it only available with a certain extension, we would put a C expression here.
-
-**`"attn\t%0,%1,%2"`**
-
-The **output template** — this is the actual assembly text GCC will emit. It is like printf:
-
-| Part | Meaning |
-|------|---------|
-| `attn` | The instruction mnemonic |
-| `\t` | A tab character (standard formatting in assembly) |
-| `%0` | Replaced with operand 0 (the rd register, e.g., `a0`) |
-| `%1` | Replaced with operand 1 (the rs1 register, e.g., `a0`) |
-| `%2` | Replaced with operand 2 (the rs2 register, e.g., `a1`) |
-
-So if GCC chooses registers a0, a0, a1, the output is: `attn	a0,a0,a1`
-
-**`[(set_attr "type" "arith") (set_attr "mode" "DI")]`**
-
-Attributes used by GCC's instruction scheduler:
-- `type "arith"` — classifies this as an arithmetic instruction (helps the scheduler estimate latency)
-- `mode "DI"` — the operation mode is 64-bit integer
-
-**Why this file:** This is the final link in the chain. Without this pattern, GCC would know that `__builtin_riscv_attn()` exists (from file 4), but would not know what assembly to emit for it. You would get an internal compiler error: `unrecognizable insn`.
-
-**Do this:**
-
-Open `gcc/gcc/config/riscv/riscv.md`. Find `(define_c_enum "unspec" [` near the top and add `UNSPEC_ATTN` inside the list. Then scroll to the very end of the file and add the entire `(define_insn "riscv_attn" ...)` block there.
+**Without this pattern**, GCC would know `__builtin_riscv_attn()` exists (from file 4) but not know what assembly to emit. You would get: `internal compiler error: unrecognizable insn`.
 
 ---
+
+## 15. File 6 — rv_custom (Opcode Registry)
+
+**Full path:** `riscv-opcodes/extensions/rv_custom`
+
+This registers the instruction in the riscv-opcodes format so the automation script can track which opcode slots are in use. It prevents future instructions from accidentally using the same slot.
+
+---
+
+# Part 4 — Building and Verifying the Builtin
 
 ## 16. Building the Toolchain — Every Command Explained
 
 ### Installing build dependencies
 
-```
-sudo apt-get install -y autoconf automake autotools-dev curl python3 libmpc-dev libmpfr-dev libgmp-dev gawk build-essential bison flex texinfo gperf libtool patchutils bc zlib1g-dev libexpat-dev
-```
-
-| Package | Why we need it |
-|---------|---------------|
-| `autoconf`, `automake`, `autotools-dev` | GNU build system tools — generates `configure` scripts and `Makefile`s |
-| `curl` | Downloads files (used by GCC's `download_prerequisites` script) |
-| `python3` | GCC's build system uses Python scripts |
-| `libmpc-dev`, `libmpfr-dev`, `libgmp-dev` | Math libraries GCC depends on for constant folding and floating-point arithmetic during compilation |
-| `gawk` | GNU Awk — a text processing tool required by GCC's build scripts |
-| `build-essential` | Meta-package: installs `gcc`, `g++`, `make`, `libc-dev` — the host compiler |
-| `bison`, `flex` | Parser and lexer generators — GCC uses these to build its C/C++ parser |
-| `texinfo` | Documentation formatting system (required even if you do not build docs) |
-| `gperf` | Perfect hash function generator — used by GCC for keyword lookup |
-| `libtool` | Shared library management tool |
-| `patchutils`, `bc` | Utility tools used by build scripts |
-| `zlib1g-dev` | Compression library — GCC uses it for compressed debug info |
-| `libexpat-dev` | XML parsing library — used by GDB (the debugger, built alongside) |
-
-**`sudo`** — runs the command as root (administrator). `apt-get install` requires root because it modifies system files.
-
-**`-y`** — automatically answers "yes" to all prompts.
-
-### Cloning the repository
-
-```
-git clone https://github.com/camelttheoot-png/riscv-gnu-toolchain
+```bash
+sudo apt-get install -y autoconf automake autotools-dev curl python3 \
+  libmpc-dev libmpfr-dev libgmp-dev gawk build-essential bison flex \
+  texinfo gperf libtool patchutils bc zlib1g-dev libexpat-dev
 ```
 
-**`git clone`** — downloads the entire repository from GitHub to your local machine. This creates a folder called `riscv-gnu-toolchain` with all the files.
+| Package | Why |
+|---------|-----|
+| `autoconf`, `automake` | GNU build system — generates `configure` and `Makefile` |
+| `libmpc-dev`, `libmpfr-dev`, `libgmp-dev` | Math libraries GCC needs for constant folding |
+| `build-essential` | Host compiler (gcc, g++, make) |
+| `bison`, `flex` | Parser/lexer generators for GCC's C parser |
+| `texinfo` | Documentation formatting (required even without building docs) |
 
-### Initializing submodules
+### Clone, patch, and build
 
-```
-git submodule update --init binutils
-git submodule update --init gcc
-```
+```bash
+# Clone the repository
+git clone https://github.com/Yash-Awasthi/riscv-gnu-toolchain.git
+cd riscv-gnu-toolchain
+git submodule update --init binutils gcc riscv-opcodes
 
-**What are submodules?** The riscv-gnu-toolchain repository does not contain the actual source code of binutils and GCC. Instead, it contains **pointers** (like bookmarks) to specific versions of those projects. Submodules are Git's way of embedding one repository inside another.
+# Apply Layer 1 patches (automated)
+cd custom_attn/scripts
+chmod +x automate_instruction.sh
+./automate_instruction.sh add attn 2
+cd ../..
 
-**`git submodule update --init`** — downloads the actual source code for the specified submodule. Without this, the `binutils/` and `gcc/` directories would be empty.
+# Apply Layer 2 (GIMPLE pass — see Part 5 for full explanation)
+cp custom_attn/src/riscv-attn-detect.cc gcc/gcc/config/riscv/
+# (plus build system modifications — detailed in section 26)
 
-### Setting up paths
-
-```
-export PREFIX=$HOME/riscv_custom
-export PATH=$PREFIX/bin:$PATH
-```
-
-**`export`** — sets an environment variable that child processes can see.
-
-**`PREFIX`** — the directory where the built tools will be installed. `$HOME` expands to your home directory (e.g., `/home/username`).
-
-**`PATH`** — the system's list of directories where it looks for executable programs. By prepending `$PREFIX/bin:`, we ensure that when you type `riscv64-unknown-elf-gcc`, the system finds our custom-built version first.
-
-### Building binutils
-
-```
-cd ~/dc/riscv-gnu-toolchain
-mkdir -p build_binutils && cd build_binutils
-```
-
-**`mkdir -p`** — creates a directory. `-p` means "no error if it already exists, and create parent directories if needed."
-
-We build in a **separate directory** (not inside the source tree). This is called an "out-of-tree build." It keeps the source code clean and lets you rebuild without cluttering source files.
-
-```
-../binutils/configure --target=riscv64-unknown-elf --prefix=$PREFIX --disable-werror
-```
-
-**`configure`** — a script that checks your system and generates `Makefile`s tailored to it. It is part of the GNU Autotools build system.
-
-| Flag | Meaning |
-|------|---------|
-| `--target=riscv64-unknown-elf` | We are building tools that produce RISC-V 64-bit code (cross-compilation) |
-| `--prefix=$PREFIX` | Install the built tools into `$PREFIX` (e.g., `~/riscv_custom`) |
-| `--disable-werror` | Do not treat compiler warnings as errors (prevents build failures from harmless warnings) |
-
-```
+# Build
+mkdir -p build && cd build
+../configure --prefix=$HOME/riscv --with-arch=rv64gc --with-abi=lp64d
 make -j$(nproc)
-```
-
-**`make`** — reads the `Makefile` generated by `configure` and compiles the source code.
-
-**`-j$(nproc)`** — run this many parallel compile jobs. `$(nproc)` is a command that returns the number of CPU cores. If you have 8 cores, this runs 8 compilations simultaneously, making the build much faster.
-
-```
-make install
-```
-
-This copies the compiled binaries into `$PREFIX/bin/`. After this, you have:
-- `$PREFIX/bin/riscv64-unknown-elf-as` (assembler)
-- `$PREFIX/bin/riscv64-unknown-elf-objdump` (disassembler)
-- `$PREFIX/bin/riscv64-unknown-elf-ld` (linker)
-- and more
-
-### Building GCC
-
-```
-mkdir -p build_gcc && cd build_gcc
-../gcc/configure --target=riscv64-unknown-elf --prefix=$PREFIX --disable-shared --disable-threads --disable-multilib --disable-libatomic --disable-libmudflap --disable-libssp --disable-libquadmath --disable-libgomp --disable-nls --disable-bootstrap --enable-languages=c --with-arch=rv64imac --with-abi=lp64 --with-newlib
+export PATH=$HOME/riscv/bin:$PATH
 ```
 
 | Flag | Meaning |
 |------|---------|
-| `--target=riscv64-unknown-elf` | Cross-compiler targeting RISC-V 64-bit |
-| `--prefix=$PREFIX` | Install location |
-| `--disable-shared` | Do not build shared libraries (simpler for embedded/bare-metal) |
-| `--disable-threads` | No threading support (bare-metal target has no OS) |
-| `--disable-multilib` | Only build for one architecture variant |
-| `--disable-libatomic` | Skip the atomic operations library |
-| `--disable-libmudflap` | Skip the pointer debugging library |
-| `--disable-libssp` | Skip stack smashing protector library |
-| `--disable-libquadmath` | Skip 128-bit floating point library |
-| `--disable-libgomp` | Skip OpenMP library |
-| `--disable-nls` | No native language support (English only, saves build time) |
-| `--disable-bootstrap` | Do not do a 3-stage bootstrap (much faster, fine for cross-compilers) |
-| `--enable-languages=c` | Only build the C compiler (not C++, Fortran, etc.) |
-| `--with-arch=rv64imac` | Target architecture: RV64 with Integer, Multiply, Atomic, Compressed |
-| `--with-abi=lp64` | ABI: Long and Pointer are 64-bit (standard for RV64 without float) |
-| `--with-newlib` | Use the Newlib C library (a minimal C library for embedded systems) |
+| `--prefix=$HOME/riscv` | Install built tools into `~/riscv/bin/` |
+| `--with-arch=rv64gc` | Target RV64GC (Integer + Multiply + Atomic + Float + Double + Compressed) |
+| `--with-abi=lp64d` | ABI: Long/Pointer = 64-bit, doubles in float registers |
+| `make -j$(nproc)` | Compile with all CPU cores in parallel (much faster) |
 
-```
-make all-gcc -j$(nproc)
-make install-gcc
-```
-
-**`all-gcc`** — this Make target builds only the compiler (`gcc`) itself, not the full runtime library. This is "stage 1" of the build. It is sufficient for our purposes because we only need to compile C to assembly/object files (`-c` flag).
-
-A full `make` would also build `libgcc`, `libstdc++`, etc., which requires a working C library (`newlib`). We skip that for speed.
+`make` takes 30-60+ minutes. It builds both binutils and GCC.
 
 ---
 
 ## 17. The Demo C Program — Line by Line
 
+This is `demo/mainbuiltin.c` — the explicit builtin path:
+
 ```c
-__attribute__((noinline))
-unsigned long run_attention(unsigned long dims_addr,
-                            unsigned long qkv_addr)
+long run_attention(long dims_addr, long qkv_addr)
 {
     return __builtin_riscv_attn(dims_addr, qkv_addr);
 }
 ```
 
-**`__attribute__((noinline))`**
+**`__builtin_riscv_attn(dims_addr, qkv_addr)`** — The compiler builtin we registered. When GCC encounters this:
+1. Looks up `attn` in its builtin table (file 4)
+2. Finds RTL pattern `"riscv_attn"` (file 5)
+3. Emits: `attn <rd>, <rs1>, <rs2>`
 
-This is a GCC extension that tells the compiler: "Do NOT inline this function." Normally, if the compiler sees a small function, it might copy its body into the caller (inlining) to avoid the overhead of a function call. We prevent this because we want `run_attention` to appear as a **separate function** in the objdump output, making the `attn` instruction easy to find.
-
-**`unsigned long`**
-
-On RV64, `unsigned long` is 64 bits — the same size as a pointer. We use it to carry memory addresses. This maps to the GCC type code `DI` (Double Integer).
-
-**`__builtin_riscv_attn(dims_addr, qkv_addr)`**
-
-This is the compiler builtin we registered. When GCC encounters this:
-1. It looks up `attn` in its builtin table (file 4: riscv-builtins.cc)
-2. It finds the RTL pattern `"riscv_attn"` (file 5: riscv.md)
-3. It emits: `attn <rd>, <rs1>, <rs2>` where the registers are chosen by GCC's register allocator
-
-The compiler does all this at compile time. There is no function call at runtime. The builtin compiles to a single machine instruction.
-
-```c
-int main(void)
-{
-    float Q[4] = {0.10f, 0.20f, 0.30f, 0.40f};
-    float K[4] = {0.50f, 0.60f, 0.70f, 0.80f};
-    float V[4] = {0.90f, 1.00f, 1.10f, 1.20f};
-```
-
-These create small matrices on the stack. In a real application, these would be much larger.
-
-```c
-    typedef struct { int rows; int cols; int seq_len; int d_model; } attn_dims_t;
-    typedef struct { float *Q; float *K; float *V; } attn_qkv_t;
-
-    attn_dims_t dims = {2, 2, 4, 8};
-    attn_qkv_t  qkv  = {Q, K, V};
-```
-
-We define and fill the two structs. The hardware accelerator would read these from memory.
-
-```c
-    volatile unsigned long result = run_attention(
-        (unsigned long)&dims,
-        (unsigned long)&qkv
-    );
-```
-
-**`(unsigned long)&dims`** — takes the address of `dims` (`&dims`) and casts it to `unsigned long`. This is how we pass a pointer as an integer register value.
-
-**`volatile`** — tells the compiler: "Do not optimize away this variable." Without `volatile`, the compiler might see that `result` is never used and remove the entire function call, which would remove our `attn` instruction from the output.
-
-```c
-    (void)result;
-    return 0;
-}
-```
-
-**`(void)result`** — suppresses the "unused variable" compiler warning.
+The builtin compiles to a **single machine instruction**. No function call overhead at runtime.
 
 ---
 
 ## 18. Compiling and Verifying — Every Command Explained
 
-### Compiling
-
-```
-riscv64-unknown-elf-gcc -O2 -march=rv64imac -mabi=lp64 -ffreestanding -nostdinc -c main.c -o main.o
-```
-
-| Flag | Meaning |
-|------|---------|
-| `riscv64-unknown-elf-gcc` | Our custom-built cross-compiler |
-| `-O2` | Optimization level 2. Makes the output cleaner and more realistic. Without optimization, GCC would insert many unnecessary loads and stores. |
-| `-march=rv64imac` | Target the RV64IMAC ISA (Integer + Multiply + Atomic + Compressed) |
-| `-mabi=lp64` | Use the LP64 ABI (Long and Pointer are 64-bit, no float in registers) |
-| `-ffreestanding` | This is a freestanding environment — no standard library is assumed. No `printf`, no `malloc`. We use this because we did not build the full C runtime. |
-| `-nostdinc` | Do not search standard include directories. We did not install headers for the target. |
-| `-c` | Compile only — produce an object file (`.o`), do not link into an executable. Linking would fail because we have no runtime library. |
-| `main.c` | Input: our C source file |
-| `-o main.o` | Output: the object file |
-
-### Disassembling
-
-```
-riscv64-unknown-elf-objdump -d main.o
+```bash
+riscv64-unknown-elf-gcc -O2 -march=rv64gc -mabi=lp64d \
+    -ffreestanding -nostdlib -c mainbuiltin.c -o mainbuiltin.o
 ```
 
 | Flag | Meaning |
 |------|---------|
-| `riscv64-unknown-elf-objdump` | Our custom-built disassembler |
-| `-d` | Disassemble — convert machine code back to assembly text |
-| `main.o` | The object file to disassemble |
+| `-O2` | Optimization level 2. Makes output cleaner. |
+| `-march=rv64gc` | Target ISA |
+| `-ffreestanding` | No standard library assumed (bare-metal) |
+| `-nostdlib` | Do not link standard libraries |
+| `-c` | Compile only — produce `.o`, do not link |
+
+```bash
+riscv64-unknown-elf-objdump -d mainbuiltin.o
+```
+
+`-d` = disassemble the object file.
 
 ---
 
@@ -1147,261 +667,690 @@ riscv64-unknown-elf-objdump -d main.o
 
 ```
 0000000000000000 <run_attention>:
-   0:   00b5050b    attn    a0,a0,a1
+   0:   02b5050b    attn    a0,a0,a1
    4:   8082        ret
 ```
 
-Let us read every part:
-
-**`0000000000000000 <run_attention>:`**
-
-This is the function label. `0000000000000000` is the address (offset within the `.text` section). In an object file (not yet linked), functions start at offset 0. `<run_attention>` is the symbol name.
-
-**`0:   00b5050b    attn    a0,a0,a1`**
-
 | Part | Meaning |
 |------|---------|
-| `0:` | Offset 0 (this is the first instruction in the function) |
-| `00b5050b` | The raw 32-bit machine code in hexadecimal. This is what the CPU actually reads. |
-| `attn` | The mnemonic — our custom instruction name! The disassembler recognized it. |
-| `a0,a0,a1` | The operands: rd=a0, rs1=a0, rs2=a1 |
+| `0:` | Offset 0 (first instruction) |
+| `02b5050b` | Raw 32-bit machine code in hex |
+| `attn` | Our custom instruction — the disassembler recognized it! |
+| `a0,a0,a1` | rd=a0, rs1=a0, rs2=a1 |
 
-Let us verify `00b5050b` manually:
+Let us manually verify `02b5050b`:
 
 ```
-Hex:    0   0   b   5   0   5   0   b
-Binary: 0000 0000 1011 0101 0000 0101 0000 1011
+Binary: 0000_0010_1011_0101_0000_0101_0000_1011
 
-Bit fields:
-[31:25] funct7 = 0000000 = 0    ✓ (matches our encoding)
-[24:20] rs2    = 01011   = 11   = a1  ✓
-[19:15] rs1    = 01010   = 10   = a0  ✓
-[14:12] funct3 = 000     = 0    ✓ (matches our encoding)
-[11:7]  rd     = 01010   = 10   = a0  ✓
-[6:0]   opcode = 0001011 = 0x0B = custom-0  ✓
+[31:25] funct7 = 0000001 = 1 = 0x01     ✓ (our funct7)
+[24:20] rs2    = 01011   = 11 = a1      ✓
+[19:15] rs1    = 01010   = 10 = a0      ✓
+[14:12] funct3 = 000     = 0            ✓
+[11:7]  rd     = 01010   = 10 = a0      ✓
+[6:0]   opcode = 0001011 = 0x0B         ✓ (custom-0)
 ```
 
-Every bit matches our design.
+Every bit matches. The toolchain works for the explicit builtin path.
 
-**`4:   8082        ret`**
-
-Offset 4 (4 bytes after the first instruction). `8082` is only 16 bits — this is a **compressed instruction** (from the C extension). `ret` is a pseudo-instruction that means "return from function" (it expands to `jalr x0, x1, 0`).
+**`4: 8082  ret`** — This is only 16 bits (a **compressed instruction** from the C extension). `ret` means "return from function."
 
 ---
 
-## 20. The Automation Script — How It Works
+# Part 5 — Layer 2: Automatic Detection (GIMPLE Pass)
 
-The file `custom_attn/automate_instruction.py` automates the entire process of adding a new custom instruction.
+This is the advanced part. Everything above taught the toolchain to recognize `attn` when you explicitly ask for it. Now we teach the **compiler** to automatically detect the attention pattern in plain C loops and replace them with `attn` — no builtin call needed.
 
-### What it does, step by step:
+## 20. What is GIMPLE?
 
-**Step 1 — Find a free opcode slot**
+When you write C code, GCC does not compile it directly to assembly. It first converts your code into an **intermediate representation** called **GIMPLE**.
 
-The script reads `riscv-opc.h` and extracts every `#define MATCH_*` value. It then iterates through all possible (base_opcode, funct3, funct7) combinations for custom-0 through custom-3, and finds the first one that is not already used.
+GIMPLE is a simplified form of your code where:
+- Every complex expression is broken into simple 3-address statements
+- All control flow is explicit (no hidden short-circuits)
+- Loops and branches use basic blocks and edges
 
-For R-type (2 inputs): iterates funct3 (0-7) × funct7 (0-127) = 1,024 slots per base.
-For R4-type (3 inputs): iterates funct3 (0-7) × funct2 (0-3) = 32 slots per base.
+### Example: C to GIMPLE
 
-**Step 2 — Modify all 5 source files**
-
-For each file, the script:
-1. Reads the current file contents
-2. Checks if the instruction is already present (idempotency)
-3. Finds the correct anchor point (using regex to handle whitespace variations)
-4. Inserts the new code at the right position
-5. Writes the file back
-
-The script is idempotent — running it twice with the same instruction name does not create duplicates.
-
-**Step 3 — Generate demo C code**
-
-Creates `demo/main_<name>.c` with the wrapper pattern:
-
-```
-wrapper_<name>() → calls __builtin_riscv_<name>() → emits the instruction
+Your C code:
+```c
+scores[i*n + j] += Q[i*d + k] * K[j*d + k];
 ```
 
-The wrapper is kept `noinline` so it shows up clearly in objdump.
+Becomes GIMPLE (simplified):
+```
+_1 = i * d;
+_2 = _1 + k;
+_3 = Q[_2];          // load from Q
+_4 = j * d;
+_5 = _4 + k;
+_6 = K[_5];          // load from K
+_7 = _3 * _6;        // multiply
+_8 = i * n;
+_9 = _8 + j;
+_10 = scores[_9];    // load current value
+_11 = _10 + _7;      // accumulate
+scores[_9] = _11;    // store back
+```
 
-**Step 4 — Rebuild toolchain**
+Every line is one simple operation. Variables like `_1`, `_2` are **SSA names** (Static Single Assignment) — each variable is assigned exactly once. This makes it easy for the compiler (and our pass) to trace where values come from.
 
-Runs `make` in the existing build directories (incremental rebuild). Since only a few files changed, this is much faster than a full build — usually under a minute.
-
-**Step 5 — Compile demo and run objdump**
-
-Compiles the generated C file and checks if the instruction mnemonic appears in the disassembly output.
-
-### Key functions in the script:
-
-| Function | What it does |
-|----------|-------------|
-| `parse_existing_match_values()` | Reads riscv-opc.h, extracts all MATCH_* hex values into a set |
-| `compute_match_mask()` | Calculates MATCH and MASK from (base_opcode, funct3, funct7/funct2) |
-| `find_free_opcode()` | Scans all 4 custom slots to find the first unused combination |
-| `modify_riscv_opc_h()` | Inserts #define MATCH/MASK and DECLARE_INSN into riscv-opc.h |
-| `modify_riscv_opc_c()` | Adds the opcode table entry to riscv-opc.c |
-| `modify_riscv_ftypes_def()` | Adds the function type to riscv-ftypes.def |
-| `modify_riscv_builtins_cc()` | Adds RISCV_ATYPE_DI, AVAIL, and DIRECT_BUILTIN to riscv-builtins.cc |
-| `modify_riscv_md()` | Adds UNSPEC and define_insn pattern to riscv.md |
-| `generate_demo_c()` | Creates the demo C file with wrapper function |
-| `rebuild_binutils()` | Runs make in the binutils build directory |
-| `rebuild_gcc()` | Runs make all-gcc in the GCC build directory |
-| `compile_and_dump()` | Compiles demo.c and runs objdump |
+**Why does this matter?** Our GIMPLE pass reads this intermediate form. It does not read your original C code. It looks at the GIMPLE statements inside loops and recognizes patterns like "multiply two array elements and accumulate" = matrix multiplication.
 
 ---
 
-## 21. R4-Type — 3-Input Instructions
+## 21. GCC's Optimization Pipeline
 
-If your custom instruction needs 3 source registers (for example, a fused multiply-add), you use the **R4-type** format:
+GCC processes your code through a series of stages. Here is the simplified pipeline:
+
+```
+C source code
+    │
+    ▼
+Parsing (builds AST — Abstract Syntax Tree)
+    │
+    ▼
+Gimplification (AST → GIMPLE)
+    │
+    ▼
+SSA Construction (variables → SSA names)
+    │
+    ▼
+Early Optimization Passes
+    │  (constant propagation, dead code elimination, inlining)
+    │
+    ▼
+Loop Optimization Passes     ◄── Our pass runs RIGHT AFTER this
+    │  (loop unrolling, vectorization, etc.)
+    │
+    ▼
+███ riscv_attn_detect ███    ◄── OUR GIMPLE PASS
+    │  (detects attention pattern, replaces with attn instruction)
+    │
+    ▼
+Late Optimization Passes
+    │
+    ▼
+RTL Generation (GIMPLE → Register Transfer Language)
+    │
+    ▼
+Register Allocation
+    │
+    ▼
+Assembly Output
+```
+
+Our pass runs after loop optimization because by that point:
+1. Loops have been normalized (canonical form with clear headers and exits)
+2. Memory accesses have been analyzed
+3. The loop tree structure is available for inspection
+
+**Important:** The pass only runs at `-O2` or higher. At `-O0` (no optimization), loop optimization is skipped, so our pass never sees the loops.
+
+---
+
+## 22. What is a Compiler Pass?
+
+A **compiler pass** is a function that walks through your code's intermediate representation (GIMPLE), analyzes it, and optionally transforms it.
+
+GCC has hundreds of built-in passes: dead code elimination, constant propagation, loop unrolling, vectorization, etc. Each pass does one specific thing.
+
+Our pass (`riscv_attn_detect`) is a custom pass we wrote and registered into GCC's pipeline. It is a **GIMPLE optimization pass** — it reads GIMPLE, looks for a specific pattern, and replaces it.
+
+### Structure of a GCC pass
+
+Every pass in GCC follows this structure:
+
+```cpp
+class pass_riscv_attn_detect : public gimple_opt_pass
+{
+public:
+  pass_riscv_attn_detect (gcc::context *ctxt)
+    : gimple_opt_pass (data, ctxt) {}
+
+  // Called for every function in the compilation unit
+  unsigned int execute (function *fun) override
+  {
+    // 1. Look at the function's loops
+    // 2. Check if they match the attention pattern
+    // 3. If yes, replace them with the attn instruction
+    return 0;
+  }
+};
+```
+
+GCC calls `execute()` once for every function being compiled. If the function has loops that match the attention pattern, we replace them. If not, we do nothing and return.
+
+---
+
+## 23. Our GIMPLE Pass — The Big Picture
+
+The file `src/riscv-attn-detect.cc` is ~1300 lines of C++. Here is the conceptual overview.
+
+### What the pass does
+
+1. **Collects all top-level loops** in the function
+2. **Slides a window of 4 consecutive loops** across them
+3. **Checks each window** against the 4-stage attention pattern:
+
+```
+Loop 1: matmul     — score[i][j] += Q[i][k] * K[j][k]     (Q × Kᵀ)
+Loop 2: scale      — score[i][j] *= 1/sqrt(d)              (÷ √dₖ)
+Loop 3: softmax    — exp, sum, normalize per row            (softmax)
+Loop 4: matmul     — out[i][j] += score[i][k] * V[k][j]    (× V)
+```
+
+4. **If all 4 match**, replaces all loops with a single `attn` instruction
+
+### The loop tree
+
+GCC organizes loops in a tree structure. Consider this code:
+
+```c
+for (i = ...) {           // Loop 1 (top-level)
+    for (j = ...) {       //   Loop 1a (child of Loop 1)
+        for (k = ...) {   //     Loop 1b (child of 1a)
+            ...
+        }
+    }
+}
+for (i = ...) {           // Loop 2 (top-level)
+    for (j = ...) {       //   Loop 2a (child of Loop 2)
+        ...
+    }
+}
+```
+
+The **loop tree** looks like:
+
+```
+Root
+├── Loop 1 (i)
+│   └── Loop 1a (j)
+│       └── Loop 1b (k)
+└── Loop 2 (i)
+    └── Loop 2a (j)
+```
+
+Our pass only looks at **top-level loops** (direct children of root). For the attention pattern, we expect 4 top-level loops:
+1. A triple-nested loop (matmul 1)
+2. A double-nested loop (scale)
+3. A loop with 2-3 children (softmax)
+4. A triple-nested loop (matmul 2)
+
+### GCC quirk: reverse order
+
+GCC's loop tree lists children in **reverse program order**. So if your code has loops A, B, C, D in that order, GCC's loop list has them as D, C, B, A. Our pass reverses them back before pattern matching.
+
+---
+
+## 24. Detection Phase — How the Pass Reads Loops
+
+For each of the 4 stages, we have a detector function.
+
+### Stage 1 & 4: `is_matmul_pattern()`
+
+Detects a triple-nested loop performing matrix multiplication:
+
+```c
+for (i = 0; i < n; i++)
+    for (j = 0; j < n; j++) {
+        float sum = 0.0f;
+        for (k = 0; k < d; k++)
+            sum += Q[i*d + k] * K[j*d + k];
+        scores[i*n + j] = sum;
+    }
+```
+
+What the detector looks for in GIMPLE:
+1. **Triple nesting:** The loop has a child, which has a child (3 levels deep)
+2. **Inner loop body** contains a `MULT_EXPR` (multiplication) and `PLUS_EXPR` (addition) — the accumulation pattern `sum += a * b`
+3. **Memory accesses** to array elements via `MEM_REF` or `TARGET_MEM_REF`
+
+The function `find_matmul_reduction()` walks the GIMPLE statements in the innermost loop body, looking for:
+```
+_temp = _a * _b;       // MULT_EXPR
+_sum = _sum_old + _temp; // PLUS_EXPR (accumulation)
+```
+
+If both operands of the multiplication come from memory loads (array accesses), and the result is accumulated, it is a matmul.
+
+### Stage 2: `is_elementwise_div()`
+
+Detects a double-nested loop performing element-wise scaling:
+
+```c
+for (i = 0; i < n; i++)
+    for (j = 0; j < n; j++)
+        scores[i*n + j] *= scale;
+```
+
+What the detector looks for:
+1. **Double nesting:** The loop has exactly one child (2 levels)
+2. **Inner loop body** contains a `MULT_EXPR` where one operand is a **loop-invariant scalar** (the scale factor — it does not change across iterations)
+3. The other operand and the store target are the same array
+
+### Stage 3: `is_softmax_pattern()`
+
+Detects the softmax computation:
+
+```c
+for (i = 0; i < n; i++) {
+    float row_sum = 0.0f;
+    for (j = 0; j < n; j++) {
+        scores[i*n + j] = __builtin_expf(scores[i*n + j]);
+        row_sum += scores[i*n + j];
+    }
+    for (j = 0; j < n; j++)
+        scores[i*n + j] /= row_sum;
+}
+```
+
+What the detector looks for:
+1. **Outer loop** with 2 or 3 **child loops** (not just nesting — sibling loops under one parent)
+2. One child contains a call to `__builtin_expf()` (the `exp` function)
+3. Another child contains `RDIV_EXPR` (division — the normalization step)
+
+Why 2 or 3 children? A numerically stable softmax has 3 steps (find max, exp+sum, normalize = 3 children). A simple softmax combines exp+sum into one loop (2 children). Our detector handles both.
+
+---
+
+## 25. Replacement Phase — How the Pass Emits the Instruction
+
+When all 4 stages match, the pass replaces all loops with a single instruction. Here is how:
+
+### Step 1: Extract function parameters
+
+The pass uses `DECL_ARGUMENTS` to get the original function parameters:
+
+```c
+void attention(int n, int d, float *Q, float *K, float *V, float *out)
+                ^^^    ^^^          ^^^        ^^^        ^^^
+```
+
+It walks the argument chain: `n` → `d` → `Q` → `K` → `V`.
+
+### Step 2: Build structs on the stack
+
+The pass inserts GIMPLE statements that build two structs on the stack:
+
+```c
+// dims struct at sp+56
+*(int*)(sp+56) = n;        // rows
+*(int*)(sp+60) = n;        // cols
+*(int*)(sp+64) = n;        // seq_len
+*(int*)(sp+68) = d;        // d_model
+
+// qkv struct at sp+72
+*(float**)(sp+72) = Q;
+*(float**)(sp+80) = K;
+*(float**)(sp+88) = V;
+```
+
+### Step 3: Create a fresh basic block
+
+This is where it gets tricky. We need to insert our instruction **before** the first loop, redirecting execution to skip all 4 loops. We use `split_edge()`:
+
+```
+BEFORE:
+  [preheader] ──edge──> [loop1 header]
+
+AFTER split_edge():
+  [preheader] ──> [NEW BLOCK] ──> [loop1 header]
+```
+
+`split_edge()` creates a fresh, empty basic block. We insert our instruction into this new block.
+
+### Step 4: Emit the `attn` instruction
+
+We use **volatile inline assembly** to emit the instruction:
+
+```c
+asm volatile (".insn r 0x0b, 0, 0x01, x0, %0, %1"
+              : /* no outputs */
+              : "r" (dims_ptr), "r" (qkv_ptr)
+              : "memory");
+```
+
+The `.insn r` directive tells the assembler to encode an R-type instruction with:
+- opcode = `0x0b` (custom-0)
+- funct3 = `0`
+- funct7 = `0x01`
+- rd = `x0` (zero register — we do not need a return value)
+- rs1 = `%0` (dims pointer, chosen by register allocator)
+- rs2 = `%1` (qkv pointer, chosen by register allocator)
+
+**Why volatile?** The `volatile` keyword tells GCC: "Do NOT remove this, even if you think the result is unused." Without it, GCC's Dead Code Elimination (DCE) pass would see that the instruction has no visible output and delete it. This was one of the hardest bugs to fix (see section 28, Fix 11).
+
+**Why not use the builtin?** We tried `__builtin_riscv_attn()` first. The problem: it returns `unsigned long`, but we never use the return value. DCE saw the unused return value and removed the entire call. Even marking it volatile in various ways did not prevent DCE. Volatile inline assembly is the only construct GCC **guarantees** it will never remove.
+
+### Step 5: Redirect control flow
+
+After inserting the instruction, we redirect the new block's outgoing edge to jump **past** all 4 loops, directly to the function's exit:
+
+```
+BEFORE:
+  [preheader] ──> [NEW BLOCK with attn] ──> [loop1 header] ──> ... ──> [loop4] ──> [exit]
+
+AFTER redirect:
+  [preheader] ──> [NEW BLOCK with attn] ──> [exit]
+
+  [loop1 header] ──> ... ──> [loop4]   ← now unreachable dead code
+```
+
+All 4 original loops become unreachable. GCC's built-in dead code elimination cleans them up automatically.
+
+---
+
+## 26. Integrating the Pass into GCC
+
+The GIMPLE pass requires 4 modifications to the GCC build system. These are done manually after the automation script.
+
+### File 7a: Copy the source
+
+```bash
+cp custom_attn/src/riscv-attn-detect.cc gcc/gcc/config/riscv/riscv-attn-detect.cc
+```
+
+This is the ~1300-line pass source file.
+
+### File 7b: Add to build objects (t-riscv)
+
+```bash
+echo '' >> gcc/gcc/config/riscv/t-riscv
+echo '# GIMPLE attention detection pass' >> gcc/gcc/config/riscv/t-riscv
+echo 'EXTRA_OBJS += riscv-attn-detect.o' >> gcc/gcc/config/riscv/t-riscv
+```
+
+`EXTRA_OBJS` tells GCC's build system to compile and link our file. Without this, the `.cc` file would sit there uncompiled.
+
+### File 7c: Add build rule (Makefile.in)
+
+```bash
+cat >> gcc/gcc/Makefile.in << 'RULE'
+
+# GIMPLE attention detection pass
+riscv-attn-detect.o : $(srcdir)/config/riscv/riscv-attn-detect.cc \
+  $(CONFIG_H) $(SYSTEM_H) coretypes.h $(TM_H) $(TREE_H) \
+  $(GIMPLE_H) tree-pass.h cfgloop.h
+	$(COMPILER) -c $(ALL_COMPILERFLAGS) $(ALL_CPPFLAGS) $(INCLUDES) \
+	  $(srcdir)/config/riscv/riscv-attn-detect.cc
+RULE
+```
+
+This tells `make` how to compile our `.cc` file and what header dependencies it has. The indented lines **must** use tab characters (not spaces) — this is a Makefile requirement.
+
+### File 7d: Register the pass (riscv.cc)
+
+```bash
+# Add the include
+sed -i '/#include "tm_p.h"/a #include "context.h"' gcc/gcc/config/riscv/riscv.cc
+
+# Register the pass
+sed -i '/^riscv_option_override (void)/,/^}/ {
+  /^}/ i\
+\
+  /* Register GIMPLE attention detection pass */\
+  extern gimple_opt_pass *make_pass_riscv_attn_detect (gcc::context *);\
+  struct register_pass_info attn_info;\
+  attn_info.pass = make_pass_riscv_attn_detect (g);\
+  attn_info.reference_pass_name = "loop";\
+  attn_info.ref_pass_instance_number = 1;\
+  attn_info.pos_op = PASS_POS_INSERT_AFTER;\
+  register_pass (&attn_info);
+}' gcc/gcc/config/riscv/riscv.cc
+```
+
+What this does:
+- `#include "context.h"` — needed for `gcc::context`, which is GCC's global state object
+- `make_pass_riscv_attn_detect(g)` — creates an instance of our pass
+- `reference_pass_name = "loop"` — insert after the "loop" pass
+- `PASS_POS_INSERT_AFTER` — insert *after* (not before) the reference pass
+
+This is how GCC's pass manager works: you tell it "insert my pass after the 'loop' pass" and it handles the scheduling.
+
+---
+
+## 27. Verifying Auto-Detection
+
+After building with both Layer 1 and Layer 2:
+
+```bash
+# Compile with auto-detection
+riscv64-unknown-elf-gcc -O2 -march=rv64gc -mabi=lp64d \
+    -ffreestanding -nostdlib -c custom_attn/demo/mainloops.c -o mainloops.o
+
+# Check the output
+riscv64-unknown-elf-objdump -d mainloops.o
+```
+
+Expected output (key section):
+
+```
+000000000000001a <.L2>:
+  1a:   00a05d63    blez    a0,34 <.L1>     # if n <= 0, skip
+  1e:   dc2a        sw      a0,56(sp)       # dims.rows = n
+  20:   de2a        sw      a0,60(sp)       # dims.cols = n
+  22:   c0aa        sw      a0,64(sp)       # dims.seq_len = n
+  24:   c2ae        sw      a1,68(sp)       # dims.d_model = d
+  26:   e4b2        sd      a2,72(sp)       # qkv.Q = Q
+  28:   e8b6        sd      a3,80(sp)       # qkv.K = K
+  2a:   ecba        sd      a4,88(sp)       # qkv.V = V
+  2c:   183c        addi    a5,sp,56        # a5 = &dims
+  2e:   00b8        addi    a4,sp,72        # a4 = &qkv
+  30:   02e7800b    attn    zero,a5,a4      # ALL 4 LOOPS REPLACED
+```
+
+**No loop code at all.** The compiler:
+1. Detected the 4-stage attention pattern
+2. Built the dims and qkv structs on the stack from the function arguments
+3. Emitted a single `attn` instruction
+4. Eliminated all original loop code
+
+### GIMPLE dump verification
+
+You can see the pass's debug output:
+
+```bash
+riscv64-unknown-elf-gcc -O2 -march=rv64gc -mabi=lp64d \
+    -ffreestanding -nostdlib -c mainloops.c -o mainloops.o \
+    -fdump-tree-all-details
+
+grep "ATTENTION PATTERN DETECTED" mainloops.c.*riscv_attn_detect
+```
+
+Output:
+```
+*** ATTENTION PATTERN DETECTED ***
+Loops: 1 (matmul1) → 2 (scale) → 3 (softmax) → 4 (matmul2)
+```
+
+---
+
+## 28. The 11 Fixes — What Went Wrong and Why
+
+Building this pass required solving 11 bugs, mostly related to GCC 15.2.0's internal behavior. These are documented here because each one teaches something about how GCC works internally.
+
+### Fix 1: TARGET_MEM_REF vs MEM_REF
+
+**Problem:** Pattern matching failed — the detector could not find array accesses.
+
+**Root cause:** GCC has two ways to represent memory accesses: `MEM_REF` (simple pointer dereference) and `TARGET_MEM_REF` (optimized memory reference with base + index + offset). After loop optimization, GCC 15 converts most `MEM_REF` nodes to `TARGET_MEM_REF`. Our detector only checked for `MEM_REF`.
+
+**Fix:** Added `TARGET_MEM_REF` checks alongside `MEM_REF` in all pattern-matching functions.
+
+### Fix 2: PLUS_EXPR operand ordering
+
+**Problem:** Matmul detection missed some cases.
+
+**Root cause:** In `sum += a * b`, the GIMPLE `PLUS_EXPR` can have the multiplication result in either rhs1 or rhs2. We only checked one position.
+
+**Fix:** Check both positions of the PLUS_EXPR operands.
+
+### Fix 3: Loop ordering (reverse program order)
+
+**Problem:** Pattern matching found the loops in wrong order — matched scale before matmul.
+
+**Root cause:** GCC's loop tree lists child loops in **reverse program order**. Code with loops A, B, C, D gets listed as D, C, B, A.
+
+**Fix:** Reverse the collected loop list before pattern matching. Added a guard: skip reversal when list length ≤ 1 to prevent unsigned integer underflow (which would crash the compiler on **every** function, breaking the entire toolchain build including newlib).
+
+### Fix 4: Softmax 2-child support
+
+**Problem:** Softmax detection failed for simple (non-numerically-stable) softmax.
+
+**Root cause:** Simple softmax produces 2 child loops (exp+sum combined, normalize), not 3 (max-reduce, exp+sum, normalize). The detector required exactly 3.
+
+**Fix:** Accept 2 or 3 children. Auto-detect which child has `__builtin_expf()` calls to handle both orderings.
+
+### Fix 5: Store target extraction
+
+**Problem:** Matmul detection could not find where the result was stored.
+
+**Root cause:** The accumulator variable (`sum`) lives in the innermost loop, but the store to the scores array happens in the **middle** loop (after the inner loop completes). We only searched the innermost loop.
+
+**Fix:** Scan the middle loop (`loop_outer(innermost)`) for memory stores.
+
+### Fix 6: Function parameter extraction
+
+**Problem:** Segfault during the replacement phase.
+
+**Root cause:** SSA base pointers from pattern matching are deep in address arithmetic chains. Calling `fold_convert()` on them caused segfaults.
+
+**Fix:** Instead of tracing SSA chains, use `DECL_ARGUMENTS` to get the original function parameters (`n`, `d`, `Q`, `K`, `V`) directly from the function declaration.
+
+### Fix 7: Header dependencies
+
+**Problem:** Various compilation errors when building the pass.
+
+**Fix:** Sorted out includes:
+- Added `cfghooks.h` for `redirect_edge_and_branch()`
+- Removed unused `tree-data-ref.h`
+- Fixed include ordering
+- Added `context.h` to `riscv.cc` for `gcc::context`
+
+### Fix 8: Builtin lookup — NULL gaps
+
+**Problem:** `__builtin_riscv_attn` not found during replacement.
+
+**Root cause:** The RISC-V target builtin table has NULL entries (gaps). Our iteration broke on the first NULL entry, never reaching `__builtin_riscv_attn` at index 506.
+
+**Fix:** Skip NULL and `error_mark_node` entries with `continue`, iterate up to 5000 entries.
+
+*Note: This fix is historical — the current implementation uses inline asm instead of the builtin call (Fix 11), so this code path is no longer used. But the fix remains in the code.*
+
+### Fix 9: Code inserted after terminating branch
+
+**Problem:** The `attn` instruction was emitted but never executed.
+
+**Root cause:** `gsi_last_bb(insert_bb)` followed by `gsi_insert_after()` placed the replacement code **after** the block's terminating branch instruction. Assembly instructions after a branch are unreachable dead code.
+
+**Fix:** Use `split_edge()` to create a fresh, empty basic block (with no terminator). Insert code using `gsi_start_bb()` on the new block. This guarantees the code is reachable.
+
+### Fix 10: exit_bb NULL — single_exit() returns NULL
+
+**Problem:** Could not find where to redirect control flow after the `attn` instruction.
+
+**Root cause:** `single_exit(loop4)` returns NULL in GCC 15 for loops with complex exit structure or stale loop analysis info.
+
+**Fix:** Three-level fallback:
+1. Try `single_exit(l4)`
+2. If NULL: manually scan loop 4's basic blocks for edges leaving the loop using `flow_bb_inside_loop_p()`
+3. Last resort: use the function's `EXIT_BLOCK` predecessor
+
+### Fix 11: DCE removes builtin call (unused result)
+
+**Problem:** The `attn` instruction was being generated correctly, then deleted by a later optimization pass. The final objdump showed the struct setup code but no `attn` instruction.
+
+**Root cause:** `__builtin_riscv_attn()` returns `unsigned long`, but the return value was never used. GCC's Dead Code Elimination pass saw the unused result and removed the entire call — even though the instruction has important side effects (it triggers a hardware accelerator).
+
+**Fix:** Switched from the builtin call to **volatile inline assembly**:
+
+```c
+asm volatile (".insn r 0x0b, 0, 0x01, x0, %0, %1" : : "r"(dims), "r"(qkv) : "memory");
+```
+
+Volatile asm is the one construct GCC **guarantees** it will never remove, regardless of optimization level. This fixed the issue permanently.
+
+---
+
+# Part 6 — Extras
+
+## 29. R4-Type — 3-Input Instructions
+
+If your custom instruction needs 3 source registers, use **R4-type**:
 
 ```
 31    27 26 25 24    20 19    15 14  12 11     7 6      0
 ┌────────┬─────┬──────┬────────┬──────┬────────┬────────┐
 │  rs3   │ f2  │ rs2  │  rs1   │funct3│   rd   │ opcode │
 └────────┴─────┴──────┴────────┴──────┴────────┴────────┘
+  5 bits  2 bits 5 bits 5 bits  3 bits  5 bits   7 bits
 ```
 
-The differences from R-type:
-- funct7 (7 bits) is split into rs3 (5 bits) + funct2 (2 bits)
-- MASK changes to `0x0600707F` (only checks opcode + funct3 + funct2, not the rs3 field)
-- Operand format string becomes `"d,s,t,r"` where `r` = integer rs3
-
-In the automation script, use `--inputs 3`:
-
-```
-python3 automate_instruction.py --name fused_mac --inputs 3
-```
-
-This generates:
-- Operand format: `"d,s,t,r"` (four integer registers)
-- Function type: `DEF_RISCV_FTYPE (3, (DI, DI, DI, DI))` → `RISCV_DI_FTYPE_DI_DI_DI`
-- Machine description with 3 input match_operands
-- Assembly output: `fused_mac %0,%1,%2,%3`
+The funct7 field splits into rs3 (5 bits) + funct2 (2 bits). Use `--inputs 3` with the automation script.
 
 ---
 
-## 22. Viva Questions and Answers
+## 30. The Automation Script — How It Works
 
-### Basic RISC-V Questions
+The file `scripts/automate_instruction.sh` (and `.py`) automates Layer 1:
 
-**Q: What does RISC-V stand for?**
-A: RISC-V is the fifth generation of processors built on the Reduced Instruction Set Computer (RISC) principles, developed at UC Berkeley. The "V" is the Roman numeral 5.
+1. **Scans** `riscv-opc.h` for all existing `MATCH_*` values
+2. **Finds** the first unused (opcode, funct3, funct7) combination
+3. **Patches** all 6 source files with the new instruction
+4. **Is idempotent** — running it twice does not create duplicates
 
-**Q: How wide is a RISC-V instruction?**
-A: Standard instructions are 32 bits (4 bytes). With the C (Compressed) extension, some common instructions can be 16 bits. Our custom instruction is 32 bits.
+Key functions:
 
-**Q: How many registers does RISC-V have?**
-A: 32 integer registers (x0-x31) and optionally 32 floating-point registers (f0-f31). x0 is hardwired to zero.
+| Function | What it does |
+|----------|-------------|
+| `find_free_opcode()` | Scans custom-0 through custom-3 for unused slots |
+| `compute_match_mask()` | Calculates MATCH and MASK from (opcode, funct3, funct7) |
+| Modify functions | Insert code at the right anchor point in each file |
 
-**Q: What is the difference between RV32 and RV64?**
-A: RV32 has 32-bit registers and addresses. RV64 has 64-bit registers and addresses. We use RV64 because pointers need to be 64 bits to address large memory spaces.
-
-### Custom Instruction Questions
-
-**Q: Where does the custom instruction's opcode come from?**
-A: RISC-V reserves four opcode slots for custom instructions: custom-0 (0x0B), custom-1 (0x2B), custom-2 (0x5B), custom-3 (0x7B). We used custom-0. These slots are guaranteed to never be used by the official specification.
-
-**Q: How did you verify the opcode slot was free?**
-A: We cloned the official `riscv-opcodes` repository and extracted all opcodes used by existing extensions using `grep`. Then we generated all 32 possible 5-bit opcode values and used `comm -23` to find values present in the full list but absent from the used list. We cross-checked against binutils source (`tc-riscv.c`) to make sure no vendor extension was using it either. Slot `0x02` (= custom-0 = `0x0B`) was confirmed free in both sources.
-
-**Q: How do you compute MATCH and MASK from the opcode?**
-A: MATCH is the exact bit pattern: `opcode | (funct3 << 12) | (funct7 << 25)`. For custom-0 with funct3=0 and funct7=0, that is `0x0B | 0 | 0 = 0x0000000B`. MASK is `0xFE00707F` for all R-type instructions — it has 1s in the opcode, funct3, and funct7 fields (the bits that identify the instruction) and 0s in the register fields (which change per usage).
-
-**Q: What format is your instruction?**
-A: R-type (Register-Register). It has three register operands: rd (destination), rs1 (source 1), rs2 (source 2), plus funct3 and funct7 fields to identify the specific instruction.
-
-**Q: What do MATCH and MASK mean?**
-A: MASK tells us which bits of the 32-bit instruction identify it (opcode + funct3 + funct7 = 0xFE00707F). MATCH is what those bits should equal (0x0000000B). The check is: `(instruction & MASK) == MATCH`.
-
-**Q: Why did you use integer registers instead of floating-point registers?**
-A: Because our operands are memory addresses (pointers to structs), not floating-point values. Addresses are integers. The actual matrix data lives in memory, accessed through these pointers.
-
-**Q: Why R-type and not R4-type?**
-A: We have only 2 inputs (address of dimensions struct + address of Q/K/V struct). R-type supports 2 source registers. R4-type is for 3 source registers.
-
-**Q: What is INSN_CLASS_I?**
-A: It classifies the instruction as belonging to the base Integer ISA. This means it does not require any extensions (like F for floating-point) to be available. Since we use integer registers, INSN_CLASS_I is correct.
-
-**Q: What does "d,s,t" mean in the opcode table?**
-A: These are operand format characters. `d` = integer rd (destination register, bits [11:7]), `s` = integer rs1 (source 1, bits [19:15]), `t` = integer rs2 (source 2, bits [24:20]).
-
-### Compiler Questions
-
-**Q: What is a compiler builtin?**
-A: A function recognized specially by the compiler. Instead of generating a function call, the compiler emits specific machine instructions directly. `__builtin_riscv_attn()` compiles to a single `attn` instruction.
-
-**Q: Why not use inline assembly?**
-A: The assignment specifically prohibits inline assembly. Using a compiler builtin is cleaner — the compiler handles register allocation, instruction scheduling, and optimization. Inline assembly bypasses all of that.
-
-**Q: What is UNSPEC in GCC?**
-A: A way to tell GCC "this operation is special, do not try to optimize or simplify it." Without UNSPEC, GCC might eliminate our instruction because it cannot understand what it does.
-
-**Q: What does the machine description (.md) file do?**
-A: It maps high-level operations (builtins) to assembly output. When GCC encounters `__builtin_riscv_attn()`, it looks up the pattern `"riscv_attn"` in riscv.md to know what assembly text to emit.
-
-**Q: What does DEF_RISCV_FTYPE do?**
-A: It defines a function type signature that builtins can use. `DEF_RISCV_FTYPE(2, (DI, DI, DI))` creates the type "returns DI, takes two DI arguments" named `RISCV_DI_FTYPE_DI_DI`.
-
-**Q: What does AVAIL(always_enabled, (!0)) mean?**
-A: It defines an availability predicate. `(!0)` evaluates to `true`, meaning the builtin is always available regardless of which ISA extensions are enabled.
-
-### Toolchain Questions
-
-**Q: What files did you modify and why?**
-A: Six files across three components:
-1. `riscv-opc.h` — Register the binary encoding (MATCH/MASK)
-2. `riscv-opc.c` — Teach the assembler/disassembler the mnemonic
-3. `riscv-ftypes.def` — Define the C function type signature
-4. `riscv-builtins.cc` — Register the `__builtin_riscv_attn()` function
-5. `riscv.md` — Tell GCC how to emit the assembly instruction
-6. `riscv-opcodes/extensions/rv_custom` — Register the opcode in riscv-opcodes format
-
-Files 1-2 are in binutils (assembler/disassembler). Files 3-5 are in GCC (compiler). File 6 is in the riscv-opcodes registry so the automation script tracks which opcode slots are in use.
-
-**Q: Why do you need both binutils AND GCC changes?**
-A: Binutils handles assembly → binary (assembler) and binary → assembly (disassembler). GCC handles C → assembly (compiler). Without binutils changes, the assembler would not recognize `attn`. Without GCC changes, the compiler would not know about `__builtin_riscv_attn()`.
-
-**Q: What is a cross-compiler?**
-A: A compiler that runs on one architecture (x86, your laptop) but produces code for a different architecture (RISC-V). We cannot run the output on our laptop — we would need a RISC-V processor or emulator.
-
-**Q: What does `make all-gcc` do vs `make`?**
-A: `make all-gcc` builds only the compiler binary itself. `make` would build the compiler plus all runtime libraries (libgcc, libstdc++, etc.). We only need the compiler for our `-c` (compile-only) workflow.
-
-**Q: What does `-ffreestanding` mean?**
-A: It tells the compiler this is a freestanding environment — no operating system, no standard library. Only language features that do not require OS support are available. We use this because we built only stage 1 GCC without a C library.
-
-### Attention Mechanism Questions
-
-**Q: What is the attention mechanism?**
-A: The core computation in Transformer models: `Attention(Q,K,V) = softmax(Q × Kᵀ / √dₖ) × V`. It computes how much each token in a sequence should "pay attention to" every other token.
-
-**Q: What are Q, K, and V?**
-A: Query, Key, and Value matrices. They are linear projections of the input. Q asks "what am I looking for?", K answers "what do I contain?", V provides "what information do I give?". The dot product Q×Kᵀ measures similarity, softmax normalizes it to probabilities, and multiplying by V produces the weighted combination.
-
-**Q: Why divide by √dₖ?**
-A: Without scaling, the dot products grow large as the dimension increases (because you are summing more terms). Large values push the softmax into regions where gradients are very small. Dividing by √dₖ keeps the variance stable. This is called "scaled dot-product attention."
-
-**Q: Can your instruction actually compute attention?**
-A: The instruction encoding and toolchain support are real. The actual computation would require a hardware accelerator that reads the struct pointers, fetches the matrices from memory, and performs the matrix operations. Our project proves the toolchain can handle the instruction; the hardware is a separate implementation.
+Usage:
+```bash
+cd custom_attn/scripts
+./automate_instruction.sh add attn 2          # Add 2-input instruction
+./automate_instruction.sh delete attn         # Remove instruction
+./automate_instruction.sh list                # List custom instructions
+./automate_instruction.sh scan 2              # Show free opcode slots
+```
 
 ---
 
-## Quick Reference Card
+## 31. Quick Reference Card
 
 ```
 Instruction:     attn rd, rs1, rs2
 Opcode slot:     custom-0 (0x0B)
 Format:          R-type
-MATCH:           0x0000000B
-MASK:            0xFE00707F
 funct3:          0x0
-funct7:          0x00
+funct7:          0x01
+MATCH:           0x0200000B
+MASK:            0xFE00707F
 GCC builtin:     __builtin_riscv_attn(unsigned long, unsigned long)
 Operand format:  "d,s,t"
 Insn class:      INSN_CLASS_I
 GCC type:        RISCV_DI_FTYPE_DI_DI
 UNSPEC:          UNSPEC_ATTN
 RTL pattern:     "riscv_attn"
+GIMPLE pass:     riscv_attn_detect (runs after "loop" pass)
 Target:          riscv64-unknown-elf
-Architecture:    rv64imac / lp64
+Architecture:    rv64gc / lp64d
+
+Files modified (Layer 1 — automated):
+  1. binutils/include/opcode/riscv-opc.h    — MATCH/MASK macros
+  2. binutils/opcodes/riscv-opc.c           — Opcode table entry
+  3. gcc/gcc/config/riscv/riscv-ftypes.def  — Function type
+  4. gcc/gcc/config/riscv/riscv-builtins.cc — Builtin registration
+  5. gcc/gcc/config/riscv/riscv.md          — Machine description
+  6. riscv-opcodes/extensions/rv_custom      — Opcode registry
+
+Files modified (Layer 2 — manual):
+  7a. gcc/gcc/config/riscv/riscv-attn-detect.cc  — GIMPLE pass (NEW)
+  7b. gcc/gcc/config/riscv/t-riscv                — Build objects
+  7c. gcc/gcc/Makefile.in                         — Build rule
+  7d. gcc/gcc/config/riscv/riscv.cc               — Pass registration
 ```

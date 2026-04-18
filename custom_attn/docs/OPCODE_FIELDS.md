@@ -11,13 +11,13 @@
 | funct3   | [14:12] | 3     | `000`      | `0x0`  | Function code (sub-operation)  |
 | rs1      | [19:15] | 5     | varies     | —      | Source integer register 1      |
 | rs2      | [24:20] | 5     | varies     | —      | Source integer register 2      |
-| funct7   | [31:25] | 7     | `0000000`  | `0x00` | Function code (extended)       |
+| funct7   | [31:25] | 7     | `0000001`  | `0x01` | Function code (extended)       |
 
 ### Encoding Constants
 
 | Constant    | Value          | Description                                   |
 |-------------|----------------|-----------------------------------------------|
-| MATCH_ATTN  | `0x0000000b`   | Fixed bits that identify the attn instruction  |
+| MATCH_ATTN  | `0x0200000b`   | Fixed bits that identify the attn instruction  |
 | MASK_ATTN   | `0xfe00707f`   | Bit mask for funct7 + funct3 + opcode fields   |
 
 ### Operand Fields
@@ -36,7 +36,7 @@ attn  rd, rs1, rs2
 
 Example:
 ```asm
-attn  a0, a0, a1    # encoded as 0x00b5050b
+attn  a0, a0, a1    # encoded as 0x02b5050b
 ```
 
 ### Instruction Format (R-type)
@@ -45,10 +45,10 @@ attn  a0, a0, a1    # encoded as 0x00b5050b
  31        25 24    20 19    15 14  12 11     7 6      0
 ┌───────────┬────────┬────────┬──────┬────────┬────────┐
 │  funct7   │  rs2   │  rs1   │funct3│   rd   │ opcode │
-│  0000000  │ 01011  │ 01010  │ 000  │ 01010  │0001011 │
-│   0x00    │  a1    │  a0    │ 0x0  │  a0    │  0x0b  │
+│  0000001  │ 01011  │ 01010  │ 000  │ 01010  │0001011 │
+│   0x01    │  a1    │  a0    │ 0x0  │  a0    │  0x0b  │
 └───────────┴────────┴────────┴──────┴────────┴────────┘
-          = 0x00B5050B  (attn a0, a0, a1)
+          = 0x02B5050B  (attn a0, a0, a1)
 ```
 
 ### Newly Added Items
@@ -64,7 +64,7 @@ attn  a0, a0, a1    # encoded as 0x00b5050b
 | xlen         | `0`           | Works on any XLEN (rv32/rv64)                |
 | isa          | `INSN_CLASS_I`| Base integer ISA (no extensions needed)      |
 | operands     | `"d,s,t"`     | Format: rd(int), rs1(int), rs2(int)          |
-| match        | `MATCH_ATTN`  | = 0x0000000b                                 |
+| match        | `MATCH_ATTN`  | = 0x0200000b                                 |
 | mask         | `MASK_ATTN`   | = 0xfe00707f                                 |
 | match_func   | `match_opcode`| Standard opcode matcher                      |
 | pinfo        | `0`           | No special flags                             |

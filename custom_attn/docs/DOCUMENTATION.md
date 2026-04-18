@@ -1232,16 +1232,19 @@ Why 2 or 3 children? A numerically stable softmax has 3 steps (find max, exp+sum
 
 When all 4 stages match, the pass replaces all loops with a single instruction. Here is how:
 
-### Step 1: Extract function parameters
+### Step 1: Extract dimensions and array pointers
 
-The pass uses `DECL_ARGUMENTS` to get the original function parameters:
+The pass needs `n`, `d`, `Q`, `K`, `V` to build the structs. It gets them from the `attn_candidate` struct, which was populated during detection:
 
-```c
-void attention(int n, int d, float *Q, float *K, float *V, float *out)
-                ^^^    ^^^          ^^^        ^^^        ^^^
-```
+- **`cand->seq_len`** — the value of `n`, extracted from the outer loop's trip count via `number_of_latch_executions(l1) + 1`
+- **`cand->d_model`** — the value of `d`, extracted from the innermost loop's trip count
+- **`cand->q_base`** — pointer to Q, extracted from matmul1's memory access pattern (`TREE_OPERAND(MEM_REF, 0)`)
+- **`cand->k_base`** — pointer to K, same source
+- **`cand->v_base`** — pointer to V, extracted from matmul2's memory access pattern
 
-It walks the argument chain: `n` → `d` → `Q` → `K` → `V`.
+This means the pass works in **any function** — it does not care about the function name or parameter signature. Whether the attention loops are in a dedicated `attention()` function or inside `main()`, the pass extracts what it needs from the loop structure itself.
+
+**Fallback:** If any candidate field is NULL (detection could not extract it), the pass falls back to `DECL_ARGUMENTS` — walking the function's parameter list assuming the signature `(int n, int d, float *Q, float *K, float *V, float *out)`. This preserves backward compatibility.
 
 ### Step 2: Build structs on the stack
 
@@ -1272,7 +1275,7 @@ The actual `build_dims_struct()` and `build_qkv_struct()` functions in the pass 
 *(float**)(sp+88) = V;
 ```
 
-The function parameters (`n`, `d`, `Q`, `K`, `V`) are obtained via `DECL_ARGUMENTS(fun->decl)`, which returns the first parameter declaration. Walking `DECL_CHAIN(param)` gives the next parameter. This is a linked list: n -> d -> Q -> K -> V. Using `DECL_ARGUMENTS` instead of tracing SSA chains was Fix 6 — SSA chains led to segfaults because the base pointers were deep in address arithmetic.
+The function parameters (`n`, `d`, `Q`, `K`, `V`) are obtained from the `attn_candidate` struct — `cand->seq_len` and `cand->d_model` come from loop trip counts, while `cand->q_base`, `cand->k_base`, `cand->v_base` come from memory access patterns detected during the detection phase. As a fallback (if any field is NULL), the pass uses `DECL_ARGUMENTS(fun->decl)` to walk the function parameter chain. The original implementation used only `DECL_ARGUMENTS` (Fix 6), which meant the pass only worked in functions with the exact `attention(int n, int d, float *Q, ...)` signature. The candidate-based approach removes that limitation.
 
 ### Step 3: Create a fresh basic block
 

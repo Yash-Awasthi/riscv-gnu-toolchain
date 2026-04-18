@@ -1117,16 +1117,45 @@ replace_attention_with_builtin (function *fun, struct attn_candidate *cand)
      rather than going through __builtin_riscv_attn, so we don't need
      to look up the builtin declaration here.  */
 
-  /* Use function parameters directly instead of SSA bases.
-     Expected signature: attention(int n, int d, float *Q, float *K,
-                                   float *V, float *out)  */
-  tree parm = DECL_ARGUMENTS (fun->decl);
-  tree p_n = parm; parm = DECL_CHAIN (parm);   /* n  */
-  tree p_d = parm; parm = DECL_CHAIN (parm);   /* d  */
-  tree p_Q = parm; parm = DECL_CHAIN (parm);   /* Q  */
-  tree p_K = parm; parm = DECL_CHAIN (parm);   /* K  */
-  tree p_V = parm; parm = DECL_CHAIN (parm);   /* V  */
-  /* tree p_out = parm; */                      /* out (unused in call)  */
+  /* Extract dimensions and pointers from the candidate struct, which
+     were populated during detection from loop trip counts and memory
+     access patterns.  This allows the pass to work in ANY function,
+     not just one with a specific parameter signature.
+
+     Fallback: if any candidate field is NULL (detection could not
+     extract it), try DECL_ARGUMENTS for backward compatibility with
+     the expected signature: attention(int n, int d, float *Q, float *K,
+                                        float *V, float *out).  */
+  tree p_n = cand->seq_len;
+  tree p_d = cand->d_model;
+  tree p_Q = cand->q_base;
+  tree p_K = cand->k_base;
+  tree p_V = cand->v_base;
+
+  /* Fallback to DECL_ARGUMENTS if any field is missing  */
+  if (!p_n || !p_d || !p_Q || !p_K || !p_V)
+    {
+      if (dump_file)
+        fprintf (dump_file, "  Candidate fields incomplete (n=%p d=%p Q=%p K=%p V=%p),"
+                 " falling back to DECL_ARGUMENTS\n",
+                 (void *)p_n, (void *)p_d, (void *)p_Q, (void *)p_K, (void *)p_V);
+      tree parm = DECL_ARGUMENTS (fun->decl);
+      if (parm && DECL_CHAIN (parm)
+          && DECL_CHAIN (DECL_CHAIN (parm))
+          && DECL_CHAIN (DECL_CHAIN (DECL_CHAIN (parm)))
+          && DECL_CHAIN (DECL_CHAIN (DECL_CHAIN (DECL_CHAIN (parm)))))
+        {
+          if (!p_n) { p_n = parm; }
+          parm = DECL_CHAIN (parm);
+          if (!p_d) { p_d = parm; }
+          parm = DECL_CHAIN (parm);
+          if (!p_Q) { p_Q = parm; }
+          parm = DECL_CHAIN (parm);
+          if (!p_K) { p_K = parm; }
+          parm = DECL_CHAIN (parm);
+          if (!p_V) { p_V = parm; }
+        }
+    }
 
   if (!p_n || !p_d || !p_Q || !p_K || !p_V)
     {

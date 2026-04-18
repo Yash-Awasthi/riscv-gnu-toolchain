@@ -912,7 +912,7 @@ def compile_and_dump(insn_name):
 
 def save_reference_copies(insn_name, num_inputs, match_val, mask_val):
     """Save copies of what was added, for documentation."""
-    src_dir = SCRIPT_DIR / "src"
+    src_dir = CUSTOM_ATTN / "src"
     src_dir.mkdir(exist_ok=True)
 
     upper = insn_name.upper()

@@ -264,15 +264,7 @@ This repository is maintained by the RISC-V foundation. It contains machine-read
 grep -o "6..2=0x[0-9A-Fa-f]*" -R extensions/ | sed 's/.*=0x//' | awk '{printf "0x%02x\n", strtonum("0x"$1)}' | sort -u > used_clean.txt
 ```
 
-What each part does:
-
-| Part | What it does |
-|------|-------------|
-| `grep -o "6..2=0x[0-9A-Fa-f]*" -R extensions/` | Searches all files for the pattern `6..2=0xNN` (the riscv-opcodes format for opcode bits). `-R` = recursive, `-o` = only print matching part. |
-| `sed 's/.*=0x//'` | Strips everything before the hex value. `sed` is a stream editor. |
-| `awk '{printf "0x%02x\n", strtonum("0x"$1)}'` | Formats each value as proper hex like `0x02`. |
-| `sort -u` | Sorts and removes duplicates. |
-| `> used_clean.txt` | Saves to file. |
+This pipeline extracts every `6..2=0xNN` pattern (the riscv-opcodes format for opcode bits) from all extension files, formats them as hex, deduplicates, and saves to `used_clean.txt`.
 
 ### Step 8.3 — Generate all possible opcode values
 
@@ -737,6 +729,151 @@ Every line is one simple operation. Variables like `_1`, `_2` are **SSA names** 
 
 **Why does this matter?** Our GIMPLE pass reads this intermediate form. It does not read your original C code. It looks at the GIMPLE statements inside loops and recognizes patterns like "multiply two array elements and accumulate" = matrix multiplication.
 
+### SSA — Static Single Assignment (Deep Dive)
+
+SSA is a property of the GIMPLE representation that makes analysis possible. The rule is simple: **every variable is assigned exactly once**. If a variable is assigned in two places, GCC creates two different SSA names for it.
+
+Regular code:
+```c
+x = 5;        // first assignment
+x = x + 1;    // second assignment — overwrites x
+y = x * 2;    // which x? the one from line 2
+```
+
+SSA form:
+```
+x_1 = 5;
+x_2 = x_1 + 1;
+y_1 = x_2 * 2;
+```
+
+Now every use points to exactly one definition. `y_1` uses `x_2`, which is defined on line 2. There is no ambiguity.
+
+**But what about if-else branches?** Consider:
+```c
+if (condition)
+    x = 10;
+else
+    x = 20;
+y = x;   // which x?
+```
+
+SSA solves this with **phi nodes** — special merge operations at join points:
+```
+if (condition)
+    x_1 = 10;
+else
+    x_2 = 20;
+x_3 = PHI(x_1, x_2);   // "pick whichever branch was taken"
+y_1 = x_3;
+```
+
+The phi node says: "x_3 is x_1 if we came from the if-branch, or x_2 if we came from the else-branch." Our pass does not create phi nodes, but it encounters them when tracing where values come from.
+
+**Def-use chains:** Because each SSA name has exactly one definition, GCC can instantly answer "where was this value defined?" For any SSA name like `_7`, you call `SSA_NAME_DEF_STMT(_7)` and get back the single GIMPLE statement that created it. Our pass uses this constantly — when it sees a multiplication, it traces both operands backward to check if they come from array loads.
+
+### Tree Codes — The Building Blocks of GIMPLE
+
+Every GIMPLE operation has a **tree code** — an enum that says what kind of operation it is. Here are the ones our pass cares about:
+
+| Tree Code | What It Means | C Equivalent | Where We Check It |
+|-----------|--------------|--------------|-------------------|
+| `MULT_EXPR` | Multiplication | `a * b` | Matmul detection — the inner `sum += a * b` |
+| `PLUS_EXPR` | Addition | `a + b` | Matmul detection — the accumulation `sum += ...` |
+| `RDIV_EXPR` | Real (float) division | `a / b` | Softmax detection — the normalize step `x /= sum` |
+| `MEM_REF` | Memory dereference | `*ptr` or `arr[i]` | Array access detection — loading from Q, K, V |
+| `TARGET_MEM_REF` | Optimized memory ref | `*(base + idx*scale + off)` | Same as MEM_REF but after GCC's loop optimizer rewrites accesses |
+| `NOP_EXPR` | Type cast (no-op) | `(float)x` | Stripped when tracing SSA chains |
+| `ADDR_EXPR` | Address-of | `&var` | Finding base pointers of arrays |
+| `POINTER_PLUS_EXPR` | Pointer arithmetic | `ptr + offset` | Array indexing in address calculations |
+| `SSA_NAME` | SSA variable reference | `_1`, `_2` | Every intermediate value |
+
+To check what operation a GIMPLE assignment performs:
+```cpp
+enum tree_code code = gimple_assign_rhs_code(stmt);
+if (code == MULT_EXPR) {
+    // This statement is a multiplication
+    tree left  = gimple_assign_rhs1(stmt);  // first operand
+    tree right = gimple_assign_rhs2(stmt);  // second operand
+}
+```
+
+### Basic Blocks and the Control Flow Graph
+
+GCC organizes code into **basic blocks** — straight-line sequences of statements with no branches in the middle. A branch or jump always ends a block, and the target of a branch always starts a new block.
+
+```c
+// Block 1 (entry)
+x = a + b;
+if (x > 0)        // ends block 1 — branch
+
+// Block 2 (then)
+    y = x * 2;
+    goto merge;    // ends block 2
+
+// Block 3 (else)
+    y = 0;
+
+// Block 4 (merge)
+z = y + 1;
+return z;
+```
+
+Blocks are connected by **edges** — directed arrows showing possible execution paths:
+```
+[Block 1] ──true──> [Block 2] ──> [Block 4]
+    │                                  ↑
+    └──false──> [Block 3] ────────────┘
+```
+
+This structure is the **Control Flow Graph (CFG)**. Our pass manipulates it during the replacement phase:
+- `split_edge(e)` — inserts a new empty block in the middle of an edge
+- `redirect_edge_and_branch(e, dest)` — changes where an edge goes
+- `flow_bb_inside_loop_p(bb, loop)` — checks if a block belongs to a loop
+
+### Key GIMPLE API Functions Used by Our Pass
+
+Here is a reference for the GCC functions our pass calls. You will see these in the source code (`riscv-attn-detect.cc`):
+
+**Reading statements:**
+| Function | Returns | Purpose |
+|----------|---------|---------|
+| `gsi_start_bb(bb)` | Iterator | Start iterating over statements in a basic block |
+| `gsi_next(&gsi)` | void | Advance to next statement |
+| `gsi_end_p(gsi)` | bool | True if no more statements |
+| `gsi_stmt(gsi)` | `gimple *` | Get the current statement |
+| `is_gimple_assign(stmt)` | bool | Is this an assignment (x = ...)? |
+| `is_gimple_call(stmt)` | bool | Is this a function call? |
+
+**Inspecting assignments:**
+| Function | Returns | Purpose |
+|----------|---------|---------|
+| `gimple_assign_rhs_code(stmt)` | `tree_code` | What operation (MULT_EXPR, PLUS_EXPR, etc.) |
+| `gimple_assign_rhs1(stmt)` | `tree` | First operand |
+| `gimple_assign_rhs2(stmt)` | `tree` | Second operand |
+| `gimple_assign_lhs(stmt)` | `tree` | Left-hand side (where result is stored) |
+
+**Inspecting calls:**
+| Function | Returns | Purpose |
+|----------|---------|---------|
+| `gimple_call_fndecl(stmt)` | `tree` | The function being called |
+| `DECL_NAME(fndecl)` | `tree` | The name of the function |
+| `IDENTIFIER_POINTER(name)` | `const char *` | The name as a C string |
+
+**Tracing SSA:**
+| Function | Returns | Purpose |
+|----------|---------|---------|
+| `SSA_NAME_DEF_STMT(ssa_name)` | `gimple *` | The statement that defined this SSA name |
+| `TREE_CODE(expr)` | `tree_code` | What kind of tree node this is |
+
+**Building new statements (used in replacement phase):**
+| Function | Returns | Purpose |
+|----------|---------|---------|
+| `gimple_build_assign(lhs, rhs)` | `gimple *` | Create `lhs = rhs` |
+| `gimple_build_assign(lhs, code, op1, op2)` | `gimple *` | Create `lhs = op1 code op2` |
+| `gimple_build_asm_vec(str, in, out, clob, lab)` | `gimple *` | Create inline asm statement |
+| `gsi_insert_after(&gsi, stmt, GSI_NEW_STMT)` | void | Insert statement after current position |
+
 ---
 
 ## 21. GCC's Optimization Pipeline
@@ -799,14 +936,34 @@ Our pass (`riscv_attn_detect`) is a custom pass we wrote and registered into GCC
 
 ### Structure of a GCC pass
 
-Every pass in GCC follows this structure:
+Every GIMPLE pass has two parts: a **data descriptor** and a **class**.
+
+The data descriptor tells GCC metadata about the pass:
+
+```cpp
+const pass_data pass_data_riscv_attn_detect = {
+  GIMPLE_PASS,           // type: this operates on GIMPLE (not RTL)
+  "riscv_attn_detect",   // name: shows in -fdump-tree-all filenames
+  OPTGROUP_NONE,         // optinfo_flags: no special optimization group
+  TV_NONE,               // tv_id: no time-variable tracking
+  PROP_cfg | PROP_ssa,   // properties_required: we need the CFG and SSA form
+  0,                     // properties_provided: we don't provide new properties
+  0,                     // properties_destroyed: we don't destroy any
+  0,                     // todo_flags_start: no setup needed before execute()
+  0                      // todo_flags_finish: no cleanup needed after execute()
+};
+```
+
+The key field is `properties_required`: `PROP_cfg | PROP_ssa` means "do not call my pass unless the function has a control flow graph and SSA form built." This guarantees that when our `execute()` runs, loops and SSA names are available.
+
+The pass class inherits from `gimple_opt_pass`:
 
 ```cpp
 class pass_riscv_attn_detect : public gimple_opt_pass
 {
 public:
   pass_riscv_attn_detect (gcc::context *ctxt)
-    : gimple_opt_pass (data, ctxt) {}
+    : gimple_opt_pass (pass_data_riscv_attn_detect, ctxt) {}
 
   // Called for every function in the compilation unit
   unsigned int execute (function *fun) override
@@ -820,6 +977,20 @@ public:
 ```
 
 GCC calls `execute()` once for every function being compiled. If the function has loops that match the attention pattern, we replace them. If not, we do nothing and return.
+
+### The factory function
+
+GCC does not instantiate passes directly. Instead, every pass provides a **factory function** that creates an instance:
+
+```cpp
+gimple_opt_pass *
+make_pass_riscv_attn_detect (gcc::context *ctxt)
+{
+  return new pass_riscv_attn_detect (ctxt);
+}
+```
+
+This is what `riscv.cc` calls when registering our pass (section 26). The `gcc::context *ctxt` parameter is GCC's global state — it gives the pass access to the compilation environment.
 
 ---
 
@@ -878,6 +1049,69 @@ Our pass only looks at **top-level loops** (direct children of root). For the at
 3. A loop with 2-3 children (softmax)
 4. A triple-nested loop (matmul 2)
 
+### The GCC loop tree API
+
+Here are the struct fields and functions used to navigate the loop tree:
+
+| API | Type | Purpose |
+|-----|------|---------|
+| `fun->x_current_loops->tree_root` | `class loop *` | The root (fake) loop containing all top-level loops |
+| `loop->inner` | `class loop *` | First child loop (or NULL if leaf) |
+| `loop->next` | `class loop *` | Next sibling loop at the same nesting level |
+| `loop->header` | `basic_block` | The basic block where the loop condition is checked |
+| `loop->latch` | `basic_block` | The basic block that jumps back to the header |
+| `loop_outer(loop)` | `class loop *` | Parent loop (one level up) |
+| `single_exit(loop)` | `edge` | The single exit edge from the loop (NULL if multiple exits) |
+| `flow_bb_inside_loop_p(bb, loop)` | `bool` | Is this basic block part of this loop? |
+
+Iterating over all top-level loops:
+```cpp
+class loop *root = fun->x_current_loops->tree_root;
+for (class loop *l = root->inner; l; l = l->next)
+{
+    // l is a top-level loop (direct child of root)
+    // l->inner gives its first child loop
+    // l->next gives the next top-level loop
+}
+```
+
+### The `attn_candidate` struct
+
+When detection succeeds, all the information is collected into a single struct:
+
+```cpp
+struct attn_candidate
+{
+  /* Stage 1: Q * K^T -> score */
+  class loop *matmul1_loop;   // the outermost loop of stage 1
+  tree q_base;                // base address of Q array
+  tree k_base;                // base address of K array
+  tree score_base;            // base address of score array
+
+  /* Stage 2: score / sqrt(d) */
+  class loop *scale_loop;     // the outermost loop of stage 2
+  tree scale_divisor;         // the sqrt(d_model) value
+
+  /* Stage 3: softmax(score) */
+  class loop *softmax_loop;   // the outermost loop of stage 3
+
+  /* Stage 4: score * V -> output */
+  class loop *matmul2_loop;   // the outermost loop of stage 4
+  tree v_base;                // base address of V array
+  tree output_base;           // base address of output array
+
+  /* Dimensions */
+  tree seq_len;               // rows (i-loop bound)
+  tree d_model;               // cols (k-loop bound in matmul1)
+
+  /* Insertion / deletion points */
+  basic_block insert_bb;      // preheader of loop 1 (where to insert attn)
+  basic_block exit_bb;        // exit of loop 4 (where to redirect flow)
+};
+```
+
+The `tree` type is GCC's universal node type — it represents any value, type, or declaration in GCC's internal representation. A `tree` for `q_base` might point to a `PARM_DECL` node for the function parameter `Q`.
+
 ### GCC quirk: reverse order
 
 GCC's loop tree lists children in **reverse program order**. So if your code has loops A, B, C, D in that order, GCC's loop list has them as D, C, B, A. Our pass reverses them back before pattern matching.
@@ -886,7 +1120,36 @@ GCC's loop tree lists children in **reverse program order**. So if your code has
 
 ## 24. Detection Phase — How the Pass Reads Loops
 
-For each of the 4 stages, we have a detector function.
+For each of the 4 stages, we have a detector function. But first, the pass relies on several helper functions that work with GIMPLE's loop and SSA structures.
+
+### Helper functions
+
+**`loop_depth_count(loop)`** — Returns how deeply nested a loop is. Walks `loop->inner` pointers, counting levels. Returns -1 if any level has sibling loops (which means it is not a perfect nest). Used to distinguish triple-nested (matmul, depth=3) from double-nested (scale, depth=2) loops.
+
+```cpp
+static int loop_depth_count (class loop *loop)
+{
+  int depth = 1;
+  class loop *inner = loop->inner;
+  while (inner) {
+      if (inner->next)
+        return -1;   // siblings = not a simple nest
+      depth++;
+      inner = inner->inner;
+  }
+  return depth;
+}
+```
+
+**`get_innermost(loop)`** — Follows `loop->inner` pointers until there are no more children. Returns the leaf loop. Used to find the innermost loop body where the actual computation happens (the `sum += a * b` statements).
+
+**`count_child_loops(loop)`** — Counts sibling loops at the first child level (iterates `loop->inner->next->next...`). Used for softmax detection — softmax has 2 or 3 child loops under one parent.
+
+**`strip_to_decl(expr)`** — The most complex helper. Given any GIMPLE expression, traces it back through SSA chains, type casts (`NOP_EXPR`), address-of operations (`ADDR_EXPR`), pointer arithmetic (`POINTER_PLUS_EXPR`), and memory references (`MEM_REF`, `TARGET_MEM_REF`) to find the underlying variable declaration (`VAR_DECL` or `PARM_DECL`). Used to check if two different array accesses ultimately refer to the same array. For example, `scores[i*n + j]` in the scale loop and `scores[i*n + j]` in the softmax loop — after all the SSA/address arithmetic is stripped, both point to the same `scores` parameter.
+
+**`arrays_share_base(base1, base2)`** — Calls `strip_to_decl()` on both arguments and checks if they resolve to the same declaration. This is how the pass verifies that loop 1's output array is the same as loop 2's input array (the `scores` matrix flows from matmul to scale to softmax).
+
+**`is_exp_call(stmt)`** — Checks if a GIMPLE call statement calls `__builtin_expf` (the exponential function). Looks at the function declaration name. Used in softmax detection.
 
 ### Stage 1 & 4: `is_matmul_pattern()`
 
@@ -912,6 +1175,16 @@ The function `find_matmul_reduction()` walks the GIMPLE statements in the innerm
 _temp = _a * _b;       // MULT_EXPR
 _sum = _sum_old + _temp; // PLUS_EXPR (accumulation)
 ```
+
+Here is how it works step by step:
+
+1. Get the innermost loop using `get_innermost()`
+2. Iterate over its header basic block's statements using `gsi_start_bb(loop->header)`
+3. For each assignment statement, check `gimple_assign_rhs_code()`:
+   - If it is `MULT_EXPR` — found the multiplication. Record both operands.
+   - If it is `PLUS_EXPR` — check if either operand is the result of the multiplication (matching the `sum += product` pattern). Note: GCC can put the multiplication result in either rhs1 or rhs2, so both positions are checked (this was Fix 2).
+4. For the multiplication operands, trace them back using `SSA_NAME_DEF_STMT()` to verify they come from memory loads (`MEM_REF` or `TARGET_MEM_REF`). If both operands are loaded from arrays, this is a dot product / matmul accumulation.
+5. The store target (where `scores[i*n+j] = sum`) is found by scanning the **middle loop** (one level up from innermost), not the innermost loop itself. This is because the final store happens after the inner k-loop completes (Fix 5).
 
 If both operands of the multiplication come from memory loads (array accesses), and the result is accumulated, it is a matmul.
 
@@ -972,7 +1245,19 @@ It walks the argument chain: `n` → `d` → `Q` → `K` → `V`.
 
 ### Step 2: Build structs on the stack
 
-The pass inserts GIMPLE statements that build two structs on the stack:
+The pass inserts GIMPLE statements that build two structs on the stack. It uses GCC's GIMPLE building APIs to construct each store:
+
+```cpp
+// Example: storing n into dims.rows at offset 56 from stack pointer
+tree sp = create_tmp_var(ptr_type_node, "sp");  // stack pointer
+tree offset = build_int_cst(integer_type_node, 56);
+tree addr = build2(POINTER_PLUS_EXPR, ptr_type_node, sp, offset);
+tree dest = build2(MEM_REF, integer_type_node, addr, ...);
+gimple *store = gimple_build_assign(dest, n_param);
+gsi_insert_after(&gsi, store, GSI_NEW_STMT);
+```
+
+The actual `build_dims_struct()` and `build_qkv_struct()` functions in the pass do this for each struct field. The result in memory:
 
 ```c
 // dims struct at sp+56
@@ -987,6 +1272,8 @@ The pass inserts GIMPLE statements that build two structs on the stack:
 *(float**)(sp+88) = V;
 ```
 
+The function parameters (`n`, `d`, `Q`, `K`, `V`) are obtained via `DECL_ARGUMENTS(fun->decl)`, which returns the first parameter declaration. Walking `DECL_CHAIN(param)` gives the next parameter. This is a linked list: n -> d -> Q -> K -> V. Using `DECL_ARGUMENTS` instead of tracing SSA chains was Fix 6 — SSA chains led to segfaults because the base pointers were deep in address arithmetic.
+
 ### Step 3: Create a fresh basic block
 
 This is where it gets tricky. We need to insert our instruction **before** the first loop, redirecting execution to skip all 4 loops. We use `split_edge()`:
@@ -1000,6 +1287,8 @@ AFTER split_edge():
 ```
 
 `split_edge()` creates a fresh, empty basic block. We insert our instruction into this new block.
+
+**Why not just insert into the preheader?** The preheader's last statement is a branch (a "terminator"). If we insert code after it, the code is unreachable — it sits after a jump instruction and never executes. This was exactly Fix 9: code was being placed after the terminating branch and silently never running. `split_edge()` creates a block with **no terminator**, so anything we insert is guaranteed to execute.
 
 ### Step 4: Emit the `attn` instruction
 
@@ -1020,9 +1309,30 @@ The `.insn r` directive tells the assembler to encode an R-type instruction with
 - rs1 = `%0` (dims pointer, chosen by register allocator)
 - rs2 = `%1` (qkv pointer, chosen by register allocator)
 
+**How this is built in GIMPLE:** The pass constructs this using `gimple_build_asm_vec()`:
+
+```cpp
+// Build the asm string
+const char *asm_str = ".insn r 0x0b, 0, 0x01, x0, %0, %1";
+
+// Build input operand vector (dims_ptr and qkv_ptr)
+vec<tree, va_gc> *inputs = NULL;
+// ... add dims_ptr and qkv_ptr as "r" constrained inputs
+
+// Build clobber list ("memory" — tells GCC this asm may read/write memory)
+vec<tree, va_gc> *clobbers = NULL;
+// ... add "memory" clobber
+
+gimple *asm_stmt = gimple_build_asm_vec(asm_str, inputs, NULL, clobbers, NULL);
+gimple_asm_set_volatile(asm_stmt, true);  // mark as volatile
+gsi_insert_after(&gsi, asm_stmt, GSI_NEW_STMT);
+```
+
 **Why volatile?** The `volatile` keyword tells GCC: "Do NOT remove this, even if you think the result is unused." Without it, GCC's Dead Code Elimination (DCE) pass would see that the instruction has no visible output and delete it. This was one of the hardest bugs to fix (see section 28, Fix 11).
 
 **Why not use the builtin?** We tried `__builtin_riscv_attn()` first. The problem: it returns `unsigned long`, but we never use the return value. DCE saw the unused return value and removed the entire call. Even marking it volatile in various ways did not prevent DCE. Volatile inline assembly is the only construct GCC **guarantees** it will never remove.
+
+**The "memory" clobber** is also critical. It tells GCC: "this asm statement reads from or writes to memory beyond what the operands explicitly reference." Without it, GCC might reorder memory operations around our instruction, breaking the struct setup that must happen before `attn` executes.
 
 ### Step 5: Redirect control flow
 
@@ -1035,7 +1345,35 @@ BEFORE:
 AFTER redirect:
   [preheader] ──> [NEW BLOCK with attn] ──> [exit]
 
-  [loop1 header] ──> ... ──> [loop4]   ← now unreachable dead code
+  [loop1 header] ──> ... ──> [loop4]   <- now unreachable dead code
+```
+
+**Finding the exit block** is done with a three-level fallback (Fix 10):
+
+```cpp
+// Try 1: single_exit() — works for simple loops
+edge exit_edge = single_exit(matmul2_loop);
+if (exit_edge)
+    exit_bb = exit_edge->dest;
+
+// Try 2: manually scan loop 4's basic blocks
+if (!exit_bb) {
+    for each basic_block bb in loop4:
+        for each outgoing edge e of bb:
+            if (!flow_bb_inside_loop_p(e->dest, loop4))
+                exit_bb = e->dest;  // found an edge leaving the loop
+}
+
+// Try 3: last resort — use the function's EXIT_BLOCK predecessor
+if (!exit_bb)
+    exit_bb = EXIT_BLOCK_PTR_FOR_FN(fun)->prev_bb;
+```
+
+`single_exit()` returns NULL in GCC 15 for loops with complex exit structures. The fallback scans all basic blocks in loop 4 and looks for any edge that goes to a block outside the loop.
+
+The actual redirect is one call:
+```cpp
+redirect_edge_and_branch(new_block_edge, exit_bb);
 ```
 
 All 4 original loops become unreachable. GCC's built-in dead code elimination cleans them up automatically.
@@ -1103,9 +1441,16 @@ sed -i '/^riscv_option_override (void)/,/^}/ {
 
 What this does:
 - `#include "context.h"` — needed for `gcc::context`, which is GCC's global state object
-- `make_pass_riscv_attn_detect(g)` — creates an instance of our pass
+- `make_pass_riscv_attn_detect(g)` — creates an instance of our pass (the factory function from section 22)
 - `reference_pass_name = "loop"` — insert after the "loop" pass
 - `PASS_POS_INSERT_AFTER` — insert *after* (not before) the reference pass
+
+**Why after the "loop" pass?** The "loop" pass is GCC's main loop optimization pipeline. It normalizes loops into a canonical form (single entry, single exit, clear header/latch structure), builds the loop tree, and performs loop analysis. Our pass depends on all of this:
+- Without loop normalization, the loop tree might not exist
+- Without loop analysis, `single_exit()` and loop nesting information would be unavailable
+- If we ran *before* the loop pass, we would see raw, un-normalized loops that are much harder to pattern-match
+
+Running *after* "loop" but *before* RTL generation is the sweet spot: loops are fully analyzed, but we are still in GIMPLE form where pattern matching is tractable.
 
 This is how GCC's pass manager works: you tell it "insert my pass after the 'loop' pass" and it handles the scheduling.
 

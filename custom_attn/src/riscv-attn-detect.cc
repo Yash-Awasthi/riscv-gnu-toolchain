@@ -196,7 +196,12 @@ strip_to_decl (tree expr)
 }
 
 
-/* Return true if BASE1 and BASE2 refer to the same underlying array.  */
+/* Return true if BASE1 and BASE2 refer to the same underlying array.
+   Uses multiple strategies to handle different GCC SSA representations:
+   1. Direct tree pointer comparison
+   2. DECL_UID comparison for declarations
+   3. SSA_NAME comparison (same SSA version = same value)
+   4. DECL_NAME string comparison as last resort  */
 
 static bool
 arrays_share_base (tree base1, tree base2)
@@ -204,18 +209,98 @@ arrays_share_base (tree base1, tree base2)
   tree d1 = strip_to_decl (base1);
   tree d2 = strip_to_decl (base2);
 
+  /* If either side could not be resolved, we cannot confirm or deny.
+     Return false so the caller can decide (warn vs. reject).  */
   if (!d1 || !d2)
     return false;
 
-  /* Direct comparison  */
+  /* Strategy 1: Direct pointer comparison  */
   if (d1 == d2)
     return true;
 
-  /* Compare by DECL_UID if both are declarations  */
+  /* Strategy 2: Compare by DECL_UID if both are declarations  */
   if (DECL_P (d1) && DECL_P (d2))
-    return DECL_UID (d1) == DECL_UID (d2);
+    {
+      if (DECL_UID (d1) == DECL_UID (d2))
+        return true;
+
+      /* Strategy 3: Compare DECL_NAME strings — covers cases where
+         the same source-level variable has different DECL nodes across
+         different SSA versions (e.g. after loop versioning).  */
+      tree name1 = DECL_NAME (d1);
+      tree name2 = DECL_NAME (d2);
+      if (name1 && name2
+          && strcmp (IDENTIFIER_POINTER (name1),
+                     IDENTIFIER_POINTER (name2)) == 0)
+        return true;
+    }
+
+  /* Strategy 4: If both are SSA_NAME referring to the same base var  */
+  if (TREE_CODE (base1) == SSA_NAME && TREE_CODE (base2) == SSA_NAME)
+    {
+      tree var1 = SSA_NAME_VAR (base1);
+      tree var2 = SSA_NAME_VAR (base2);
+      if (var1 && var2 && var1 == var2)
+        return true;
+      if (var1 && var2 && DECL_P (var1) && DECL_P (var2)
+          && DECL_UID (var1) == DECL_UID (var2))
+        return true;
+    }
 
   return false;
+}
+
+
+/* Lenient base check: returns true if arrays definitely share a base,
+   or if the check is inconclusive (both sides resolved to non-NULL
+   but different trees that could be SSA artifacts).  Only returns
+   false when we can positively determine the bases differ (e.g.
+   different PARM_DECLs with different names).  */
+
+static bool
+arrays_share_base_lenient (tree base1, tree base2)
+{
+  /* If the strict check passes, we're sure.  */
+  if (arrays_share_base (base1, base2))
+    return true;
+
+  tree d1 = strip_to_decl (base1);
+  tree d2 = strip_to_decl (base2);
+
+  /* If either side could not be resolved, give benefit of the doubt.  */
+  if (!d1 || !d2)
+    return true;
+
+  /* If both are PARM_DECLs with different names, they are definitely
+     different parameters — this is a hard reject.  */
+  if (DECL_P (d1) && DECL_P (d2)
+      && TREE_CODE (d1) == PARM_DECL && TREE_CODE (d2) == PARM_DECL)
+    {
+      tree name1 = DECL_NAME (d1);
+      tree name2 = DECL_NAME (d2);
+      if (name1 && name2
+          && strcmp (IDENTIFIER_POINTER (name1),
+                     IDENTIFIER_POINTER (name2)) != 0)
+        return false;
+    }
+
+  /* For local VAR_DECLs with clearly different UIDs and names,
+     reject.  */
+  if (DECL_P (d1) && DECL_P (d2)
+      && TREE_CODE (d1) == VAR_DECL && TREE_CODE (d2) == VAR_DECL
+      && DECL_UID (d1) != DECL_UID (d2))
+    {
+      tree name1 = DECL_NAME (d1);
+      tree name2 = DECL_NAME (d2);
+      if (name1 && name2
+          && strcmp (IDENTIFIER_POINTER (name1),
+                     IDENTIFIER_POINTER (name2)) != 0)
+        return false;
+    }
+
+  /* Inconclusive — assume same base (SSA artifacts may cause
+     different tree nodes for the same source variable).  */
+  return true;
 }
 
 
@@ -322,16 +407,6 @@ find_matmul_reduction (class loop *innermost,
                       accum = rhs2;
                     }
                 }
-              if (!mult_result && TREE_CODE (rhs1) == SSA_NAME)
-                {
-                  gimple *def = SSA_NAME_DEF_STMT (rhs1);
-                  if (def && is_gimple_assign (def)
-                      && gimple_assign_rhs_code (def) == MULT_EXPR)
-                    {
-                      mult_result = rhs1;
-                      accum = rhs2;
-                    }
-                }
 
               if (!mult_result)
                 continue;
@@ -396,13 +471,12 @@ find_matmul_reduction (class loop *innermost,
 
               if (ref_a && ref_b)
                 {
-                  /* Extract base pointers from the memory references  */
-                  *a_ref = (TREE_CODE (ref_a) == MEM_REF)
-                           ? TREE_OPERAND (ref_a, 0)
-                           : TREE_OPERAND (ref_a, 0);
-                  *b_ref = (TREE_CODE (ref_b) == MEM_REF)
-                           ? TREE_OPERAND (ref_b, 0)
-                           : TREE_OPERAND (ref_b, 0);
+                  /* Extract base pointers from the memory references.
+                     MEM_REF: operand 0 is the base pointer.
+                     TARGET_MEM_REF: operand 0 is the base pointer.
+                     ARRAY_REF: operand 0 is the array object.  */
+                  *a_ref = TREE_OPERAND (ref_a, 0);
+                  *b_ref = TREE_OPERAND (ref_b, 0);
 
                   /* The accumulation target (score) — trace through the
                      store that writes back the accumulated value.  */
@@ -526,40 +600,48 @@ is_elementwise_div (class loop *loop, tree *arr_base, tree *divisor)
                           || TREE_CODE (r) == TARGET_MEM_REF
                           || TREE_CODE (r) == ARRAY_REF)
                         {
-                          *arr_base = (TREE_CODE (r) == MEM_REF)
-                                      ? TREE_OPERAND (r, 0)
-                                      : TREE_OPERAND (r, 0);
+                          *arr_base = TREE_OPERAND (r, 0);
                           found = true;
                         }
                     }
                 }
             }
 
-          /* Also handle:  arr[i][j] = arr[i][j] * (1.0 / divisor)  */
+          /* Also handle:  arr[i][j] = arr[i][j] * (1.0 / divisor)
+             GCC may place the reciprocal in rhs1 or rhs2.  */
           if (code == MULT_EXPR && !found)
             {
-              tree rhs2 = gimple_assign_rhs2 (stmt);
-              if (TREE_CODE (rhs2) == SSA_NAME)
+              tree rhs1_m = gimple_assign_rhs1 (stmt);
+              tree rhs2_m = gimple_assign_rhs2 (stmt);
+
+              /* Try both operand orders: the reciprocal (RDIV_EXPR)
+                 could be in either rhs1 or rhs2.  */
+              for (int swap = 0; swap < 2 && !found; swap++)
                 {
-                  gimple *def = SSA_NAME_DEF_STMT (rhs2);
-                  if (def && is_gimple_assign (def)
-                      && gimple_assign_rhs_code (def) == RDIV_EXPR)
+                  tree recip_op  = (swap == 0) ? rhs2_m : rhs1_m;
+                  tree array_op  = (swap == 0) ? rhs1_m : rhs2_m;
+
+                  if (TREE_CODE (recip_op) != SSA_NAME)
+                    continue;
+                  gimple *def = SSA_NAME_DEF_STMT (recip_op);
+                  if (!def || !is_gimple_assign (def)
+                      || gimple_assign_rhs_code (def) != RDIV_EXPR)
+                    continue;
+
+                  *divisor = gimple_assign_rhs2 (def);
+
+                  if (TREE_CODE (array_op) == SSA_NAME)
                     {
-                      *divisor = gimple_assign_rhs2 (def);
-                      tree rhs1_inner = gimple_assign_rhs1 (stmt);
-                      if (TREE_CODE (rhs1_inner) == SSA_NAME)
+                      gimple *ld = SSA_NAME_DEF_STMT (array_op);
+                      if (ld && is_gimple_assign (ld))
                         {
-                          gimple *ld = SSA_NAME_DEF_STMT (rhs1_inner);
-                          if (ld && is_gimple_assign (ld))
+                          tree r = gimple_assign_rhs1 (ld);
+                          if (TREE_CODE (r) == MEM_REF
+                              || TREE_CODE (r) == TARGET_MEM_REF
+                              || TREE_CODE (r) == ARRAY_REF)
                             {
-                              tree r = gimple_assign_rhs1 (ld);
-                              if (TREE_CODE (r) == MEM_REF
-                                  || TREE_CODE (r) == TARGET_MEM_REF
-                                  || TREE_CODE (r) == ARRAY_REF)
-                                {
-                                  *arr_base = TREE_OPERAND (r, 0);
-                                  found = true;
-                                }
+                              *arr_base = TREE_OPERAND (r, 0);
+                              found = true;
                             }
                         }
                     }
@@ -672,35 +754,43 @@ is_softmax_pattern (class loop *loop, tree *arr_base)
 
   /* --- Child 2: sum-of-exp ---
      Look for: sum += exp(something)
-     i.e., a PLUS_EXPR reduction where one operand traces back to exp().  */
-  bool has_exp_sum = false;
+     i.e., a PLUS_EXPR reduction where one operand traces back to exp().
+     We require BOTH an exp() call AND a PLUS_EXPR accumulation to
+     distinguish this from unrelated loops that happen to call exp().  */
+  bool has_exp = false;
+  bool has_plus_accum = false;
   {
     basic_block *bbs = get_loop_body (child2);
     unsigned nbbs = child2->num_nodes;
-    for (unsigned i = 0; i < nbbs && !has_exp_sum; i++)
+    for (unsigned i = 0; i < nbbs; i++)
       {
         for (gimple_stmt_iterator gsi = gsi_start_bb (bbs[i]);
              !gsi_end_p (gsi); gsi_next (&gsi))
           {
             gimple *stmt = gsi_stmt (gsi);
-            /* Direct call to exp in this loop?  */
             if (is_exp_call (stmt))
-              has_exp_sum = true;
+              has_exp = true;
+            if (is_gimple_assign (stmt)
+                && gimple_assign_rhs_code (stmt) == PLUS_EXPR)
+              has_plus_accum = true;
           }
       }
     free (bbs);
   }
 
-  if (!has_exp_sum)
+  if (!has_exp || !has_plus_accum)
     {
       if (dump_file)
-        fprintf (dump_file, "  Softmax: child2 has no exp() call\n");
+        fprintf (dump_file, "  Softmax: child2 missing exp()=%d or "
+                 "PLUS accumulation=%d\n", (int)has_exp, (int)has_plus_accum);
       return false;
     }
 
   /* --- Child 3: normalization ---
-     Look for: arr[i][j] = exp(...) / sum
-     i.e., RDIV_EXPR where one operand traces back to exp().  */
+     Look for: arr[i][j] = something / sum
+     i.e., RDIV_EXPR (division).  We specifically require a division
+     operation — merely having exp() in this loop is not sufficient,
+     as that would conflate the exp-sum and normalize stages.  */
   bool has_normalize = false;
   {
     basic_block *bbs = get_loop_body (child3);
@@ -714,8 +804,25 @@ is_softmax_pattern (class loop *loop, tree *arr_base)
             if (is_gimple_assign (stmt)
                 && gimple_assign_rhs_code (stmt) == RDIV_EXPR)
               has_normalize = true;
-            if (is_exp_call (stmt))
-              has_normalize = true; /* exp present in normalize loop  */
+            /* Also accept MULT_EXPR by a reciprocal (1.0/sum),
+               which GCC may produce instead of RDIV.  */
+            if (is_gimple_assign (stmt)
+                && gimple_assign_rhs_code (stmt) == MULT_EXPR)
+              {
+                tree r1 = gimple_assign_rhs1 (stmt);
+                tree r2 = gimple_assign_rhs2 (stmt);
+                for (int s = 0; s < 2; s++)
+                  {
+                    tree candidate = (s == 0) ? r2 : r1;
+                    if (TREE_CODE (candidate) == SSA_NAME)
+                      {
+                        gimple *d = SSA_NAME_DEF_STMT (candidate);
+                        if (d && is_gimple_assign (d)
+                            && gimple_assign_rhs_code (d) == RDIV_EXPR)
+                          has_normalize = true;
+                      }
+                  }
+              }
           }
       }
     free (bbs);
@@ -849,14 +956,17 @@ detect_attention_pattern (function *fun, struct attn_candidate *cand)
                    d2 ? get_tree_code_name (TREE_CODE (d2)) : "NULL",
                    d2 && DECL_P (d2) ? (int)DECL_UID (d2) : -1);
         }
-      /* Base check skipped — SSA tracing too fragile across GCC versions.
-if (!arrays_share_base (score_base_1, scale_arr))
+      /* Lenient base check: rejects only when bases are provably
+         different (e.g. different PARM_DECLs).  Tolerates SSA
+         artifacts that produce different tree nodes for the same
+         source-level variable.  */
+      if (!arrays_share_base_lenient (score_base_1, scale_arr))
         {
           if (dump_file)
             fprintf (dump_file, "  Stage 2 FAIL: array base mismatch "
                      "(matmul output ≠ scaled array)\n");
           continue;
-        } */
+        }
 
       /* Stage 3: softmax(score)  */
       tree softmax_arr;
@@ -869,14 +979,13 @@ if (!arrays_share_base (score_base_1, scale_arr))
         }
 
       /* Verify softmax operates on the same score array  */
-      /* Base check skipped — SSA tracing too fragile across GCC versions.
-if (!arrays_share_base (score_base_1, softmax_arr))
+      if (!arrays_share_base_lenient (score_base_1, softmax_arr))
         {
           if (dump_file)
             fprintf (dump_file, "  Stage 3 FAIL: array base mismatch "
                      "(score ≠ softmax input)\n");
           continue;
-        } */
+        }
 
       /* Stage 4: matmul score * V → output  */
       tree matmul2_a, matmul2_b, matmul2_c;
@@ -889,14 +998,13 @@ if (!arrays_share_base (score_base_1, softmax_arr))
         }
 
       /* Verify the first operand of matmul2 is the score array  */
-      /* Base check skipped — SSA tracing too fragile across GCC versions.
-if (!arrays_share_base (score_base_1, matmul2_a))
+      if (!arrays_share_base_lenient (score_base_1, matmul2_a))
         {
           if (dump_file)
             fprintf (dump_file, "  Stage 4 FAIL: matmul2 operand A "
                      "≠ score array\n");
           continue;
-        } */
+        }
 
       /* ── All 4 stages matched! ──  */
       if (dump_file)
@@ -1019,35 +1127,11 @@ cleanup:
  *  SECTION E: Pattern replacement — emit the builtin call
  * ═══════════════════════════════════════════════════════════════════ */
 
-/* Find the __builtin_riscv_attn function declaration by iterating
-   the target builtin table.
-
-   The RISC-V builtin table may contain NULL entries (gaps) between
-   valid builtins.  We must skip them instead of stopping at the first
-   NULL.  The iteration upper bound of 5000 is generous — the table
-   is typically a few hundred entries.  */
-
-static tree
-find_attn_builtin (void)
-{
-  for (unsigned i = 0; i < 5000; i++)
-    {
-      tree decl = targetm.builtin_decl (i, false);
-      if (decl == NULL_TREE || decl == error_mark_node)
-        continue;
-      const char *name = IDENTIFIER_POINTER (DECL_NAME (decl));
-      if (name && strcmp (name, "__builtin_riscv_attn") == 0)
-        return decl;
-    }
-  return NULL_TREE;
-}
-
-
 /* Build a RECORD_TYPE with the given INT fields on the stack.
    Returns the VAR_DECL for the stack variable.
 
    attn_dims_t:  { int rows, cols, seq_len, d_model }
-   attn_qkv_t:   { float *Q, *K, *V }                    */
+   attn_qkv_t:   { float *Q, *K, *V, *out }                  */
 
 static tree
 build_dims_struct (function *fun)
@@ -1095,16 +1179,20 @@ build_qkv_struct (function *fun)
                          get_identifier ("K"), ptr_type);
   tree f_v = build_decl (UNKNOWN_LOCATION, FIELD_DECL,
                          get_identifier ("V"), ptr_type);
+  tree f_out = build_decl (UNKNOWN_LOCATION, FIELD_DECL,
+                           get_identifier ("out"), ptr_type);
 
   DECL_CHAIN (f_q) = f_k;
   DECL_CHAIN (f_k) = f_v;
-  DECL_CHAIN (f_v) = NULL_TREE;
+  DECL_CHAIN (f_v) = f_out;
+  DECL_CHAIN (f_out) = NULL_TREE;
 
   tree qkv_type = make_node (RECORD_TYPE);
   TYPE_FIELDS (qkv_type) = f_q;
   DECL_CONTEXT (f_q) = qkv_type;
   DECL_CONTEXT (f_k) = qkv_type;
   DECL_CONTEXT (f_v) = qkv_type;
+  DECL_CONTEXT (f_out) = qkv_type;
   layout_type (qkv_type);
 
   tree qkv_var = create_tmp_var (qkv_type, "attn_qkv");
@@ -1144,19 +1232,22 @@ replace_attention_with_builtin (function *fun, struct attn_candidate *cand)
   tree p_Q = cand->q_base;
   tree p_K = cand->k_base;
   tree p_V = cand->v_base;
+  tree p_out = cand->output_base;
 
   /* Fallback to DECL_ARGUMENTS if any field is missing  */
-  if (!p_n || !p_d || !p_Q || !p_K || !p_V)
+  if (!p_n || !p_d || !p_Q || !p_K || !p_V || !p_out)
     {
       if (dump_file)
-        fprintf (dump_file, "  Candidate fields incomplete (n=%p d=%p Q=%p K=%p V=%p),"
+        fprintf (dump_file, "  Candidate fields incomplete (n=%p d=%p Q=%p K=%p V=%p out=%p),"
                  " falling back to DECL_ARGUMENTS\n",
-                 (void *)p_n, (void *)p_d, (void *)p_Q, (void *)p_K, (void *)p_V);
+                 (void *)p_n, (void *)p_d, (void *)p_Q, (void *)p_K,
+                 (void *)p_V, (void *)p_out);
       tree parm = DECL_ARGUMENTS (fun->decl);
       if (parm && DECL_CHAIN (parm)
           && DECL_CHAIN (DECL_CHAIN (parm))
           && DECL_CHAIN (DECL_CHAIN (DECL_CHAIN (parm)))
-          && DECL_CHAIN (DECL_CHAIN (DECL_CHAIN (DECL_CHAIN (parm)))))
+          && DECL_CHAIN (DECL_CHAIN (DECL_CHAIN (DECL_CHAIN (parm))))
+          && DECL_CHAIN (DECL_CHAIN (DECL_CHAIN (DECL_CHAIN (DECL_CHAIN (parm))))))
         {
           if (!p_n) { p_n = parm; }
           parm = DECL_CHAIN (parm);
@@ -1167,10 +1258,12 @@ replace_attention_with_builtin (function *fun, struct attn_candidate *cand)
           if (!p_K) { p_K = parm; }
           parm = DECL_CHAIN (parm);
           if (!p_V) { p_V = parm; }
+          parm = DECL_CHAIN (parm);
+          if (!p_out) { p_out = parm; }
         }
     }
 
-  if (!p_n || !p_d || !p_Q || !p_K || !p_V)
+  if (!p_n || !p_d || !p_Q || !p_K || !p_V || !p_out)
     {
       if (dump_file)
         fprintf (dump_file, "  ERROR: cannot extract function parameters\n");
@@ -1282,6 +1375,12 @@ replace_attention_with_builtin (function *fun, struct attn_candidate *cand)
     build3 (COMPONENT_REF, ptr_type, qkv_var, fq, NULL_TREE),
     fold_convert (ptr_type, p_V));
   gsi_insert_after (&gsi, sv, GSI_NEW_STMT);
+
+  fq = DECL_CHAIN (fq);
+  gimple *so = gimple_build_assign (
+    build3 (COMPONENT_REF, ptr_type, qkv_var, fq, NULL_TREE),
+    fold_convert (ptr_type, p_out));
+  gsi_insert_after (&gsi, so, GSI_NEW_STMT);
 
   /* 3. Volatile barrier  */
   gasm *barrier = gimple_build_asm_vec ("", NULL, NULL, NULL, NULL);
@@ -1420,12 +1519,13 @@ public:
     : gimple_opt_pass (pass_data_riscv_attn_detect, ctxt)
   {}
 
-  /* Gate: always run for RISC-V targets.
-     A future enhancement could gate on -march containing a custom
-     extension flag (e.g. Xattn) or a dedicated -mattn-detect flag.  */
+  /* Gate: run only at -O2 or higher, since the pass depends on
+     loop infrastructure that is not reliably available at -O0/-O1.
+     A future enhancement could add a dedicated -mattn-detect flag
+     or gate on -march containing a custom extension (e.g. Xattn).  */
   bool gate (function *) final override
   {
-    return true;
+    return optimize >= 2;
   }
 
   unsigned int execute (function *fun) final override

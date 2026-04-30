@@ -1,16 +1,39 @@
-# Sample batch file for automate_instruction.py
-# Format: name  inputs  description
-# Max 4 instructions per batch (one per custom-0..3 base)
+# Sample batch file for automate_instruction.sh / automate_instruction.py
 #
-# Usage: python3 automate_instruction.py --batch instructions_example.txt
+# Format:
+#   name  inputs  description (rest of line)
 #
-# Input counts:
-#   0 = no source registers (R-type, rs1=x0, rs2=x0)
-#   1 = one source register (R-type, rs2=x0)
-#   2 = two source registers (R-type)
-#   3 = three source registers (R4-type)
+# inputs:
+#   0 = no source registers    (R-type, rs1=x0, rs2=x0)
+#   1 = one source register    (R-type, rs2=x0)
+#   2 = two source registers   (R-type)
+#   3 = three source registers (R4-type, rs1 rs2 rs3)
+#
+# Max 4 instructions per batch (custom-0 through custom-3 slots).
+# Lines starting with # are ignored.
+#
+# Usage:
+#   ./automate_instruction.sh batch instructions_example.txt
+#   python3 automate_instruction.py --batch instructions_example.txt
+#
+# Verify afterwards:
+#   ./automate_instruction.sh verify hw_status my_relu my_pow fused_mac
+#   ./verify_patch.sh hw_status my_relu my_pow fused_mac
 
-hw_status   0  read hardware status register
-my_relu     1  max(0, x) activation function
-my_pow      2  (a^b)^a power operation
-fused_mac   3  a*b+c fused multiply-add
+# ─── General-purpose examples ────────────────────────────────────────────────
+hw_status   0  read hardware status/control register
+my_relu     1  ReLU activation: max(0, x) on a float array
+my_pow      2  (a^b)^a — custom power operation
+fused_mac   3  fused multiply-add: a*b+c in one instruction
+
+# ─── ML / AI acceleration examples (uncomment to use) ────────────────────────
+# vec_dot     2  dot product of two float vectors (addresses in rs1, rs2)
+# softmax1d   1  row-wise softmax on a 1-D float array
+# layer_norm  2  layer normalisation: (x - mean) / sqrt(var + eps)
+# gelu        1  Gaussian Error Linear Unit activation function
+
+# ─── Notes ────────────────────────────────────────────────────────────────────
+# - Instruction names must be lowercase alphanumeric + underscore.
+# - Each instruction gets its own opcode slot (custom-0..3).
+# - The automation picks the next free funct3/funct7 combination automatically.
+# - Use `./identify_free_opcodes.sh --detailed` to see what slots are available.

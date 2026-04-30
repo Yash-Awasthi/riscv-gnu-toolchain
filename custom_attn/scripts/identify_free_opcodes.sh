@@ -345,6 +345,7 @@ NUM_INPUTS=2
 LIMIT=20
 CHECK_VAL=""
 DO_OPCODES_SCAN=false
+JSON_MODE=false
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -353,8 +354,10 @@ while [[ $# -gt 0 ]]; do
         --limit)     LIMIT="$2"; shift 2 ;;
         --check)     MODE="check"; CHECK_VAL="$2"; shift 2 ;;
         --riscv-opcodes) DO_OPCODES_SCAN=true; shift ;;
+        --json)      JSON_MODE=true; shift ;;
+        --repo-root) REPO_ROOT="$2"; OPC_H="${REPO_ROOT}/binutils/include/opcode/riscv-opc.h"; shift 2 ;;
         -h|--help)
-            echo "Usage: $0 [--detailed] [--inputs N] [--limit N] [--check 0xHEX] [--riscv-opcodes]"
+            echo "Usage: $0 [--detailed] [--inputs N] [--limit N] [--check 0xHEX] [--riscv-opcodes] [--json]"
             echo ""
             echo "Options:"
             echo "  --detailed         Show detailed list of free slots"
@@ -362,6 +365,8 @@ while [[ $# -gt 0 ]]; do
             echo "  --limit N          Max slots in detailed mode (default: 20)"
             echo "  --check 0xHEX      Check if a specific MATCH value is free"
             echo "  --riscv-opcodes    Also scan riscv-opcodes/extensions/"
+            echo "  --json             Machine-readable: print first free slot as JSON"
+            echo "  --repo-root PATH   Override repo root path"
             exit 0
             ;;
         *) echo "Unknown option: $1"; exit 1 ;;
@@ -380,6 +385,29 @@ trap "rm -f $MATCH_FILE" EXIT
 
 check_opc_h
 extract_match_values
+
+# ── JSON mode — machine-readable output of first free slot ───────────
+if $JSON_MODE; then
+    # Find first free R-type slot and emit JSON (used by scripts/tools)
+    for name in "${BASE_ORDER[@]}"; do
+        local_base="${CUSTOM_BASES[$name]}"
+        base=$((local_base))
+        base_bits="${BASE_BITS[$name]}"
+        for f3 in $(seq 0 7); do
+            for f7 in $(seq 0 127); do
+                m=$(compute_match_rtype $base $f3 $f7)
+                if ! is_taken "$m"; then
+                    mask="0xfe00707f"
+                    printf '{"base":"%s","base_opc":"0x%02x","base_bits":"%s","funct3":%d,"funct7":%d,"match":"0x%08x","mask":"%s"}\n' \
+                        "$name" "$base" "$base_bits" "$f3" "$f7" "$m" "$mask"
+                    exit 0
+                fi
+            done
+        done
+    done
+    echo '{"error":"No free R-type slots found"}'
+    exit 1
+fi
 
 if $DO_OPCODES_SCAN; then
     scan_riscv_opcodes

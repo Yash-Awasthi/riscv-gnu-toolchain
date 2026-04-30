@@ -17,6 +17,12 @@
 # ══════════════════════════════════════════════════════════════════════
 set -euo pipefail
 
+# ── Dry-run mode ──────────────────────────────────────────────────────
+# Set DRY_RUN=true (or pass --dry-run) to preview all changes without
+# writing any files. Every modify_* and delete_from_* function honours
+# this flag.
+DRY_RUN=false
+
 # ── Paths ────────────────────────────────────────────────────────────
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(dirname "$(dirname "$SCRIPT_DIR")")"
@@ -52,6 +58,7 @@ info()    { echo -e "  ${CYAN}[$1]${NC} $2"; }
 ok()      { echo -e "  ${GREEN}[$1]${NC} $2"; }
 warn()    { echo -e "  ${YELLOW}[$1]${NC} $2"; }
 err()     { echo -e "  ${RED}[$1]${NC} $2"; }
+dry()     { echo -e "  ${YELLOW}[dry-run]${NC} would: $1"; }
 
 banner() {
     echo "================================================================"
@@ -119,12 +126,9 @@ parse_existing_matches() {
 
 compute_match() {
     # compute_match <base_opc> <funct3> <funct7_or_funct2> <num_inputs>
-    local base=$1 f3=$2 f7_f2=$3 ni=$4
-    if [[ $ni -le 2 ]]; then
-        printf "0x%08x" $(( base | (f3 << 12) | (f7_f2 << 25) ))
-    else
-        printf "0x%08x" $(( base | (f3 << 12) | (f7_f2 << 25) ))
-    fi
+    # R-type and R4-type share the same bit layout for these fields.
+    local base=$1 f3=$2 f7_f2=$3
+    printf "0x%08x" $(( base | (f3 << 12) | (f7_f2 << 25) ))
 }
 
 compute_mask() {
@@ -264,6 +268,11 @@ modify_opc_h() {
         return
     fi
 
+    if $DRY_RUN; then
+        dry "add MATCH_${upper}=${match_val}, MASK_${upper}=${mask_val}, DECLARE_INSN to $(basename "$OPC_H")"
+        return
+    fi
+
     # Add MATCH/MASK after "Instruction opcode macros"
     local define_block
     define_block="\n/* Custom Instruction — ${name} ${MARKER} */\n#define MATCH_${upper}  ${match_val}\n#define MASK_${upper}   ${mask_val}\n"
@@ -295,6 +304,11 @@ modify_opc_c() {
         return
     fi
 
+    if $DRY_RUN; then
+        dry "add {\"${name}\", ..., MATCH_${upper}, MASK_${upper}} to riscv_opcodes[] in $(basename "$OPC_C")"
+        return
+    fi
+
     local entry="\n/* Custom Instruction — ${name} ${MARKER} */\n{\"${name}\", 0, INSN_CLASS_I, \"${fmt}\", MATCH_${upper}, MASK_${upper}, match_opcode, 0},"
 
     # Insert after opening brace of riscv_opcodes[]
@@ -316,6 +330,11 @@ modify_ftypes_def() {
         return
     fi
 
+    if $DRY_RUN; then
+        dry "add ${fname} / ${fline} to $(basename "$FTYPES_DEF")"
+        return
+    fi
+
     echo "" >> "$FTYPES_DEF"
     echo "/* Custom instruction ftype ${MARKER}: ${fname} */" >> "$FTYPES_DEF"
     echo "$fline" >> "$FTYPES_DEF"
@@ -325,6 +344,11 @@ modify_ftypes_def() {
 modify_builtins_cc() {
     local name=$1 ni=$2
     local fname=$(get_ftype_name "$ni")
+
+    if $DRY_RUN; then
+        dry "add RISCV_ATYPE_DI, AVAIL(always_enabled), DIRECT_BUILTIN(${name}) to $(basename "$BUILTINS_CC")"
+        return
+    fi
 
     # 1. RISCV_ATYPE_DI
     if ! grep -q "RISCV_ATYPE_DI" "$BUILTINS_CC" 2>/dev/null; then
@@ -366,6 +390,11 @@ modify_riscv_md() {
     local unspec="UNSPEC_${upper}"
     local asm_ops=$(get_asm_operands "$ni")
 
+    if $DRY_RUN; then
+        dry "add ${unspec} to unspec enum and define_insn \"riscv_${name}\" to $(basename "$RISCV_MD")"
+        return
+    fi
+
     # 1. Add to unspec enum
     if ! grep -q "$unspec" "$RISCV_MD" 2>/dev/null; then
         sed -i "/(define_c_enum \"unspec\" \[/a\\  ;; Custom Instruction — ${name} ${MARKER}\n  ${unspec}" "$RISCV_MD"
@@ -406,6 +435,19 @@ ENDOFMD
 modify_rv_custom() {
     local name=$1 ni=$2 base_bits=$3 f3=$4 f7f2=$5
 
+    local line=""
+    case "$ni" in
+        0) line="${name} rd 19..15=0 24..20=0 31..25=${f7f2} 14..12=${f3} 6..2=${base_bits} 1..0=3" ;;
+        1) line="${name} rd rs1 24..20=0 31..25=${f7f2} 14..12=${f3} 6..2=${base_bits} 1..0=3" ;;
+        2) line="${name} rd rs1 rs2 31..25=${f7f2} 14..12=${f3} 6..2=${base_bits} 1..0=3" ;;
+        3) line="${name} rd rs1 rs2 rs3 26..25=${f7f2} 14..12=${f3} 6..2=${base_bits} 1..0=3" ;;
+    esac
+
+    if $DRY_RUN; then
+        dry "add to rv_custom: ${line}"
+        return
+    fi
+
     if [[ ! -f "$RV_CUSTOM" ]]; then
         mkdir -p "$(dirname "$RV_CUSTOM")"
         cat > "$RV_CUSTOM" << 'EOF'
@@ -414,14 +456,6 @@ modify_rv_custom() {
 
 EOF
     fi
-
-    local line=""
-    case "$ni" in
-        0) line="${name} rd 19..15=0 24..20=0 31..25=${f7f2} 14..12=${f3} 6..2=${base_bits} 1..0=3" ;;
-        1) line="${name} rd rs1 24..20=0 31..25=${f7f2} 14..12=${f3} 6..2=${base_bits} 1..0=3" ;;
-        2) line="${name} rd rs1 rs2 31..25=${f7f2} 14..12=${f3} 6..2=${base_bits} 1..0=3" ;;
-        3) line="${name} rd rs1 rs2 rs3 26..25=${f7f2} 14..12=${f3} 6..2=${base_bits} 1..0=3" ;;
-    esac
 
     if grep -q "^${name} " "$RV_CUSTOM" 2>/dev/null; then
         local existing
@@ -604,45 +638,70 @@ generate_demo() {
     local wrapper="wrapper_${name}"
     local fmt=$(get_format_name "$ni")
 
-    local wrapper_params wrapper_call main_body
+    # wrapper signature and body vary by input count
+    local wrapper_params wrapper_call setup_vars call_line
     case "$ni" in
         0)
             wrapper_params="void"
             wrapper_call="${builtin}()"
-            main_body="    volatile unsigned long result = ${wrapper}();"
+            setup_vars=""
+            call_line="    unsigned long result = ${wrapper}();"
             ;;
         1)
             wrapper_params="unsigned long a0"
             wrapper_call="${builtin}(a0)"
-            main_body="    unsigned long A = 42;\n    volatile unsigned long result = ${wrapper}((unsigned long)&A);"
+            setup_vars="    unsigned long A = 42;"
+            call_line="    unsigned long result = ${wrapper}((unsigned long)&A);"
             ;;
         2)
             wrapper_params="unsigned long a0, unsigned long a1"
             wrapper_call="${builtin}(a0, a1)"
-            main_body="    float A = 2.0f;\n    float B = 4.0f;\n    volatile unsigned long result = ${wrapper}(\n        (unsigned long)&A, (unsigned long)&B);"
+            setup_vars="    float A = 2.0f;\n    float B = 4.0f;"
+            call_line="    unsigned long result = ${wrapper}(\n        (unsigned long)&A, (unsigned long)&B);"
             ;;
         3)
             wrapper_params="unsigned long a0, unsigned long a1, unsigned long a2"
             wrapper_call="${builtin}(a0, a1, a2)"
-            main_body="    float A = 2.0f;\n    float B = 4.0f;\n    float C = 6.0f;\n    volatile unsigned long result = ${wrapper}(\n        (unsigned long)&A, (unsigned long)&B, (unsigned long)&C);"
+            setup_vars="    float A = 2.0f;\n    float B = 4.0f;\n    float C = 6.0f;"
+            call_line="    unsigned long result = ${wrapper}(\n        (unsigned long)&A, (unsigned long)&B, (unsigned long)&C);"
             ;;
     esac
 
     cat > "$DEMO_DIR/main_${name}.c" << ENDOFC
 /*
  * main_${name}.c — Demo for custom RISC-V instruction "${name}"
- * Description: ${desc}
- * Inputs: ${ni} (${fmt})
- * Builtin: ${builtin}()
  *
- * Compile:
- *   riscv64-unknown-elf-gcc -O2 -march=rv64imac -mabi=lp64 \\
- *       -ffreestanding -nostdinc -c main_${name}.c -o main_${name}.o
+ * Description : ${desc}
+ * Inputs      : ${ni} (${fmt})
+ * Builtin     : ${builtin}()
  *
- * Disassemble:
+ * The compiler emits the custom instruction inside wrapper_${name}().
+ * The main() function calls it and prints the result — no inline asm.
+ *
+ * Compile (with patched toolchain, full executable):
+ *   riscv64-unknown-elf-gcc -O2 -march=rv64gc -mabi=lp64d \\
+ *       main_${name}.c -o main_${name} -lm
+ *
+ * Run (QEMU userspace):
+ *   qemu-riscv64 ./main_${name}
+ *
+ * Verify instruction was emitted:
+ *   riscv64-unknown-elf-objdump -d main_${name} | grep "${name}"
+ *
+ * Compile (object only — for screenshot without running):
+ *   riscv64-unknown-elf-gcc -O2 -march=rv64gc -mabi=lp64d \\
+ *       -c main_${name}.c -o main_${name}.o
  *   riscv64-unknown-elf-objdump -d main_${name}.o
  */
 
+#include <stdio.h>
+#include <stdint.h>
+
+/* ── Custom instruction wrapper ─────────────────────────────────
+ * The __attribute__((noinline)) prevents the compiler from inlining
+ * this function, ensuring the custom instruction is visible in the
+ * disassembly of wrapper_${name}().
+ * ─────────────────────────────────────────────────────────────── */
 __attribute__((noinline))
 unsigned long ${wrapper}(${wrapper_params})
 {
@@ -651,36 +710,56 @@ unsigned long ${wrapper}(${wrapper_params})
 
 int main(void)
 {
-$(echo -e "${main_body}")
-    (void)result;
+    printf("=== Custom instruction demo: ${name} ===\\n");
+    printf("    Description: ${desc}\\n\\n");
+
+$(echo -e "${setup_vars}")
+$(echo -e "${call_line}")
+
+    printf("    ${wrapper}() returned: 0x%016lx\\n", result);
+    printf("\\nVerify with:\\n");
+    printf("  riscv64-unknown-elf-objdump -d main_${name} | grep ${name}\\n");
+
     return 0;
 }
 ENDOFC
 
-    ok "demo" "Generated main_${name}.c"
+    ok "demo" "Generated main_${name}.c (runnable with qemu-riscv64)"
 
-    # Build script
+    # Build + verify script
     cat > "$DEMO_DIR/build_${name}.sh" << ENDOFSH
 #!/usr/bin/env bash
+# build_${name}.sh — Compile, run, and verify the ${name} demo
 set -euo pipefail
+
 RISCV_PREFIX="\${RISCV_PREFIX:-riscv64-unknown-elf}"
 DIR="\$(cd "\$(dirname "\$0")" && pwd)"
+SRC="\$DIR/main_${name}.c"
+BIN="\$DIR/main_${name}"
+OBJ="\$DIR/main_${name}.o"
 
-echo "=== Compiling main_${name}.c ==="
-"\${RISCV_PREFIX}-gcc" -O2 -march=rv64imac -mabi=lp64 \\
-    -ffreestanding -nostdinc \\
-    -c "\$DIR/main_${name}.c" -o "\$DIR/main_${name}.o"
-
-echo ""
-echo "=== Full Disassembly ==="
-"\${RISCV_PREFIX}-objdump" -d "\$DIR/main_${name}.o" | tee "\$DIR/main_${name}_objdump.txt"
+echo "=== [1/3] Compiling main_${name}.c (full executable) ==="
+"\${RISCV_PREFIX}-gcc" -O2 -march=rv64gc -mabi=lp64d \\
+    "\$SRC" -o "\$BIN" -lm
 
 echo ""
-echo "=== Grep for '${name}' instruction ==="
-"\${RISCV_PREFIX}-objdump" -d "\$DIR/main_${name}.o" | grep -n "${name}" || echo "(not found)"
+echo "=== [2/3] Disassembly — grep for '${name}' ==="
+"\${RISCV_PREFIX}-objdump" -d "\$BIN" | grep -n "${name}" \\
+    || echo "  (not found — check toolchain patch)"
 
 echo ""
-echo "Build complete."
+echo "=== [3/3] Running under qemu-riscv64 ==="
+if command -v qemu-riscv64 &>/dev/null; then
+    qemu-riscv64 "\$BIN"
+else
+    echo "  qemu-riscv64 not in PATH — install with:"
+    echo "    sudo apt install qemu-user  (Debian/Ubuntu)"
+fi
+
+echo ""
+echo "Object-only (for screenshot without running):"
+echo "  \${RISCV_PREFIX}-gcc -O2 -c \$SRC -o \$OBJ"
+echo "  \${RISCV_PREFIX}-objdump -d \$OBJ"
 ENDOFSH
     chmod +x "$DEMO_DIR/build_${name}.sh"
     ok "demo" "Generated build_${name}.sh"
@@ -854,6 +933,84 @@ cmd_batch() {
 }
 
 # ══════════════════════════════════════════════════════════════════════
+#  VERIFY — Check if an instruction is present in all 6 files
+# ══════════════════════════════════════════════════════════════════════
+
+cmd_verify() {
+    local overall_pass=true
+    for name in "$@"; do
+        name=$(sanitize_name "$name")
+        local upper=$(to_upper "$name")
+        local pass=true
+
+        echo ""
+        echo "  Verifying: ${name}"
+        echo "  ────────────────────────────────────────────────────"
+
+        # File 1: riscv-opc.h — MATCH + MASK + DECLARE_INSN
+        if grep -q "MATCH_${upper}" "$OPC_H" 2>/dev/null && \
+           grep -q "MASK_${upper}"  "$OPC_H" 2>/dev/null && \
+           grep -q "DECLARE_INSN(${name}," "$OPC_H" 2>/dev/null; then
+            ok "opc.h" "MATCH_${upper}, MASK_${upper}, DECLARE_INSN — PRESENT"
+        else
+            err "opc.h" "MATCH/MASK/DECLARE_INSN — MISSING"
+            pass=false
+        fi
+
+        # File 2: riscv-opc.c — opcodes table entry
+        if grep -q "\"${name}\"" "$OPC_C" 2>/dev/null; then
+            ok "opc.c" "\"${name}\" in riscv_opcodes[] — PRESENT"
+        else
+            err "opc.c" "\"${name}\" in riscv_opcodes[] — MISSING"
+            pass=false
+        fi
+
+        # File 3: riscv-ftypes.def — at least one DEF_RISCV_FTYPE with DI
+        if grep -q "DEF_RISCV_FTYPE" "$FTYPES_DEF" 2>/dev/null; then
+            ok "ftypes.def" "DEF_RISCV_FTYPE entries — PRESENT"
+        else
+            err "ftypes.def" "DEF_RISCV_FTYPE entries — MISSING"
+            pass=false
+        fi
+
+        # File 4: riscv-builtins.cc — DIRECT_BUILTIN
+        if grep -q "DIRECT_BUILTIN (${name}," "$BUILTINS_CC" 2>/dev/null; then
+            ok "builtins.cc" "DIRECT_BUILTIN(${name}) — PRESENT"
+        else
+            err "builtins.cc" "DIRECT_BUILTIN(${name}) — MISSING"
+            pass=false
+        fi
+
+        # File 5: riscv.md — UNSPEC_ constant + define_insn
+        if grep -q "UNSPEC_${upper}" "$RISCV_MD" 2>/dev/null && \
+           grep -q "riscv_${name}" "$RISCV_MD" 2>/dev/null; then
+            ok "riscv.md" "UNSPEC_${upper} + define_insn — PRESENT"
+        else
+            err "riscv.md" "UNSPEC_${upper} / define_insn — MISSING"
+            pass=false
+        fi
+
+        # File 6: rv_custom — riscv-opcodes entry
+        if [[ -f "$RV_CUSTOM" ]] && grep -q "^${name} " "$RV_CUSTOM" 2>/dev/null; then
+            ok "rv_custom" "\"${name}\" entry — PRESENT"
+        else
+            warn "rv_custom" "\"${name}\" entry — MISSING (optional)"
+        fi
+
+        echo "  ────────────────────────────────────────────────────"
+        if $pass; then
+            ok "RESULT" "${name} — ALL 5 required files patched correctly ✓"
+        else
+            err "RESULT" "${name} — INCOMPLETE — run: $0 add ${name} <inputs>"
+            overall_pass=false
+        fi
+    done
+
+    echo ""
+    $overall_pass && echo "  All instructions verified." || { echo "  Some instructions are incomplete."; return 1; }
+}
+
+# ══════════════════════════════════════════════════════════════════════
 #  INTERACTIVE — Prompt user
 # ══════════════════════════════════════════════════════════════════════
 
@@ -877,11 +1034,24 @@ cmd_interactive() {
 
 banner
 
+# ── Parse global flags before subcommand ─────────────────────────────
+for arg in "$@"; do
+    [[ "$arg" == "--dry-run" ]] && DRY_RUN=true
+done
+# Remove --dry-run from positional args
+set -- "${@/--dry-run/}"
+# Remove empty strings left by substitution
+NEW_ARGS=()
+for arg in "$@"; do [[ -n "$arg" ]] && NEW_ARGS+=("$arg"); done
+set -- "${NEW_ARGS[@]+"${NEW_ARGS[@]}"}"
+
+$DRY_RUN && echo -e "  ${YELLOW}[DRY-RUN MODE]${NC} No files will be modified.\n"
+
 case "${1:-}" in
     add)
         shift
         if [[ $# -lt 2 ]]; then
-            echo "Usage: $0 add <name> <inputs:0-3> [description]"
+            echo "Usage: $0 add <name> <inputs:0-3> [description] [--dry-run]"
             exit 1
         fi
         name=$1; ni=$2; shift 2
@@ -891,7 +1061,7 @@ case "${1:-}" in
     delete)
         shift
         if [[ $# -lt 1 ]]; then
-            echo "Usage: $0 delete <name> [name2 ...]"
+            echo "Usage: $0 delete <name> [name2 ...] [--dry-run]"
             exit 1
         fi
         cmd_delete "$@"
@@ -910,26 +1080,40 @@ case "${1:-}" in
     batch)
         shift
         if [[ $# -lt 1 ]]; then
-            echo "Usage: $0 batch <file>"
+            echo "Usage: $0 batch <file> [--dry-run]"
             exit 1
         fi
         cmd_batch "$1"
         ;;
+    verify)
+        shift
+        if [[ $# -lt 1 ]]; then
+            echo "Usage: $0 verify <name> [name2 ...]"
+            exit 1
+        fi
+        cmd_verify "$@"
+        ;;
     help|--help|-h)
         echo ""
         echo "Usage:"
-        echo "  $0 add <name> <inputs:0-3> [description]"
-        echo "  $0 delete <name> [name2 ...]"
+        echo "  $0 add <name> <inputs:0-3> [description] [--dry-run]"
+        echo "  $0 delete <name> [name2 ...]           [--dry-run]"
+        echo "  $0 verify <name> [name2 ...]"
         echo "  $0 list"
         echo "  $0 scan <inputs:0-3>"
-        echo "  $0 batch <file>"
-        echo "  $0                          # Interactive"
+        echo "  $0 batch <file>                        [--dry-run]"
+        echo "  $0                                     # Interactive"
+        echo ""
+        echo "Flags:"
+        echo "  --dry-run    Preview all changes without writing any files"
         echo ""
         echo "Examples:"
         echo "  $0 add my_pow 2 '(a^b)^a'"
+        echo "  $0 add my_pow 2 '(a^b)^a' --dry-run    # preview only"
         echo "  $0 add hw_status 0 'read hardware status'"
         echo "  $0 add my_relu 1 'max(0,x)'"
         echo "  $0 add fused_mac 3 'a*b+c'"
+        echo "  $0 verify attn                          # check if attn is in all 6 files"
         echo "  $0 delete my_pow"
         echo "  $0 delete my_pow fused_mac"
         echo "  $0 batch instructions_example.txt"

@@ -107,6 +107,13 @@ struct attn_candidate
 static tree
 lookup_riscv_attn_builtin_decl ()
 {
+  static tree cached_decl = NULL_TREE;
+  static bool searched = false;
+
+  if (searched)
+    return cached_decl;
+
+  searched = true;
   const char *name = "__builtin_riscv_attn";
 
   /* RISC-V target builtin tables can have NULL gaps, so scan a bounded range
@@ -119,10 +126,13 @@ lookup_riscv_attn_builtin_decl ()
       if (TREE_CODE (decl) != FUNCTION_DECL || !DECL_NAME (decl))
         continue;
       if (strcmp (IDENTIFIER_POINTER (DECL_NAME (decl)), name) == 0)
-        return decl;
+        {
+          cached_decl = decl;
+          return cached_decl;
+        }
     }
 
-  return NULL_TREE;
+  return cached_decl;
 }
 
 

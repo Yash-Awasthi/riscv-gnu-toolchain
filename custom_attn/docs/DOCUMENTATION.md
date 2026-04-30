@@ -337,7 +337,7 @@ Where:
 You cannot pass three entire matrices through CPU registers. Registers are 64 bits wide — they hold one number. So we pass **memory addresses** (pointers) to structs:
 
 - `rs1` points to a struct containing the matrix dimensions
-- `rs2` points to a struct containing three pointers to Q, K, and V in memory
+- `rs2` points to a struct containing pointers to Q, K, V, and the output matrix in memory
 
 A hardware accelerator would read the struct, DMA the matrices from memory, and compute the attention.
 
@@ -355,6 +355,7 @@ typedef struct {
     float *Q;      // pointer to Query matrix
     float *K;      // pointer to Key matrix
     float *V;      // pointer to Value matrix
+    float *out;    // pointer to Output matrix
 } attn_qkv_t;
 ```
 
@@ -511,18 +512,19 @@ UNSPEC_ATTN
 
 Added inside the `(define_c_enum "unspec" [...])` block.
 
-**What is UNSPEC?** GCC's internal representation has standard operations like `plus`, `mult`, `and`. But `attn` is completely custom — there is no standard operation for "compute attention." `UNSPEC` tells GCC: "this is a special operation — do not try to optimize, simplify, or reorder it. Just emit it as-is."
+**What is UNSPEC_VOLATILE?** GCC's internal representation has standard operations like `plus`, `mult`, `and`. But `attn` is a custom accelerator command with memory side effects. `unspec_volatile` tells GCC: "this is a special side-effecting operation — do not delete, simplify, or freely reorder it."
 
-Without `UNSPEC`, GCC might remove our instruction entirely (thinking it has no effect) or try to combine it with other operations.
+The accompanying `(clobber (mem:BLK (scratch)))` conservatively models that the accelerator may read or write memory reachable through the pointer operands.
 
 ### Piece 2: Instruction pattern
 
 ```lisp
 (define_insn "riscv_attn"
   [(set (match_operand:DI 0 "register_operand" "=r")
-        (unspec:DI [(match_operand:DI 1 "register_operand" "r")
-                    (match_operand:DI 2 "register_operand" "r")]
-                   UNSPEC_ATTN))]
+        (unspec_volatile:DI [(match_operand:DI 1 "register_operand" "r")
+                             (match_operand:DI 2 "register_operand" "r")]
+                            UNSPEC_ATTN))
+   (clobber (mem:BLK (scratch)))]
   ""
   "attn\t%0,%1,%2"
   [(set_attr "type" "arith")
@@ -537,7 +539,8 @@ This is dense but logical. Every part:
 | `set (match_operand:DI 0 ... "=r")` | Output: 64-bit integer in a register. `=` = write-only, `r` = general register. This is `rd`. |
 | `match_operand:DI 1 ... "r"` | Input 1: 64-bit integer register (read). This is `rs1`. |
 | `match_operand:DI 2 ... "r"` | Input 2: 64-bit integer register (read). This is `rs2`. |
-| `UNSPEC_ATTN` | Our custom operation identifier |
+| `UNSPEC_ATTN` | Our custom operation identifier used by `unspec_volatile` |
+| `clobber (mem:BLK (scratch))` | Conservative memory side-effect model for the accelerator command |
 | `""` | Condition: empty = always valid |
 | `"attn\t%0,%1,%2"` | Assembly template: `%0` = rd, `%1` = rs1, `%2` = rs2 |
 | `set_attr "type" "arith"` | Tells the scheduler this is an arithmetic instruction |
@@ -871,7 +874,7 @@ Here is a reference for the GCC functions our pass calls. You will see these in 
 |----------|---------|---------|
 | `gimple_build_assign(lhs, rhs)` | `gimple *` | Create `lhs = rhs` |
 | `gimple_build_assign(lhs, code, op1, op2)` | `gimple *` | Create `lhs = op1 code op2` |
-| `gimple_build_asm_vec(str, in, out, clob, lab)` | `gimple *` | Create inline asm statement |
+| `gimple_build_call(fn, nargs, ...)` | `gcall *` | Create a call to the registered builtin |
 | `gsi_insert_after(&gsi, stmt, GSI_NEW_STMT)` | void | Insert statement after current position |
 
 ---
@@ -1273,9 +1276,10 @@ The actual `build_dims_struct()` and `build_qkv_struct()` functions in the pass 
 *(float**)(sp+72) = Q;
 *(float**)(sp+80) = K;
 *(float**)(sp+88) = V;
+*(float**)(sp+96) = out;
 ```
 
-The function parameters (`n`, `d`, `Q`, `K`, `V`) are obtained from the `attn_candidate` struct — `cand->seq_len` and `cand->d_model` come from loop trip counts, while `cand->q_base`, `cand->k_base`, `cand->v_base` come from memory access patterns detected during the detection phase. As a fallback (if any field is NULL), the pass uses `DECL_ARGUMENTS(fun->decl)` to walk the function parameter chain. The original implementation used only `DECL_ARGUMENTS` (Fix 6), which meant the pass only worked in functions with the exact `attention(int n, int d, float *Q, ...)` signature. The candidate-based approach removes that limitation.
+The function parameters (`n`, `d`, `Q`, `K`, `V`, `out`) are obtained from the `attn_candidate` struct — `cand->seq_len` and `cand->d_model` come from loop trip counts, while `cand->q_base`, `cand->k_base`, `cand->v_base`, and `cand->output_base` come from memory access patterns detected during the detection phase. As a fallback (if any field is NULL), the pass uses `DECL_ARGUMENTS(fun->decl)` to walk the function parameter chain. The original implementation used only `DECL_ARGUMENTS` (Fix 6), which meant the pass only worked in functions with the exact `attention(int n, int d, float *Q, float *K, float *V, float *out)` signature. The candidate-based approach removes that limitation.
 
 ### Step 3: Create a fresh basic block
 
@@ -1295,47 +1299,30 @@ AFTER split_edge():
 
 ### Step 4: Emit the `attn` instruction
 
-We use **volatile inline assembly** to emit the instruction:
-
-```c
-asm volatile (".insn r 0x0b, 0, 0x01, x0, %0, %1"
-              : /* no outputs */
-              : "r" (dims_ptr), "r" (qkv_ptr)
-              : "memory");
-```
-
-The `.insn r` directive tells the assembler to encode an R-type instruction with:
-- opcode = `0x0b` (custom-0)
-- funct3 = `0`
-- funct7 = `0x01`
-- rd = `x0` (zero register — we do not need a return value)
-- rs1 = `%0` (dims pointer, chosen by register allocator)
-- rs2 = `%1` (qkv pointer, chosen by register allocator)
-
-**How this is built in GIMPLE:** The pass constructs this using `gimple_build_asm_vec()`:
+The pass emits a real call to the registered compiler builtin:
 
 ```cpp
-// Build the asm string
-const char *asm_str = ".insn r 0x0b, 0, 0x01, x0, %0, %1";
-
-// Build input operand vector (dims_ptr and qkv_ptr)
-vec<tree, va_gc> *inputs = NULL;
-// ... add dims_ptr and qkv_ptr as "r" constrained inputs
-
-// Build clobber list ("memory" — tells GCC this asm may read/write memory)
-vec<tree, va_gc> *clobbers = NULL;
-// ... add "memory" clobber
-
-gimple *asm_stmt = gimple_build_asm_vec(asm_str, inputs, NULL, clobbers, NULL);
-gimple_asm_set_volatile(asm_stmt, true);  // mark as volatile
-gsi_insert_after(&gsi, asm_stmt, GSI_NEW_STMT);
+tree attn_result = create_tmp_var (long_unsigned_type_node, "attn_result");
+gcall *attn_call = gimple_build_call (attn_builtin, 2, dims_addr, qkv_addr);
+gimple_call_set_lhs (attn_call, attn_result);
+gsi_insert_after (&gsi, attn_call, GSI_NEW_STMT);
 ```
 
-**Why volatile?** The `volatile` keyword tells GCC: "Do NOT remove this, even if you think the result is unused." Without it, GCC's Dead Code Elimination (DCE) pass would see that the instruction has no visible output and delete it. This was one of the hardest bugs to fix (see section 28, Fix 11).
+That builtin is the same explicit interface user code can call directly:
 
-**Why not use the builtin?** We tried `__builtin_riscv_attn()` first. The problem: it returns `unsigned long`, but we never use the return value. DCE saw the unused return value and removed the entire call. Even marking it volatile in various ways did not prevent DCE. Volatile inline assembly is the only construct GCC **guarantees** it will never remove.
+```c
+unsigned long status = __builtin_riscv_attn(dims_addr, qkv_addr);
+```
 
-**The "memory" clobber** is also critical. It tells GCC: "this asm statement reads from or writes to memory beyond what the operands explicitly reference." Without it, GCC might reorder memory operations around our instruction, breaking the struct setup that must happen before `attn` executes.
+GCC lowers the builtin through the `riscv_attn` RTL pattern, whose assembly template is the named mnemonic:
+
+```asm
+attn	%0,%1,%2
+```
+
+The pass also stores the builtin result to a compiler-generated volatile status local. That makes the call observable to tree/GIMPLE DCE even if user code does not consume the status value.
+
+The RTL pattern uses `unspec_volatile` and `(clobber (mem:BLK (scratch)))`. This is the GCC-native side-effect model for the accelerator command: it keeps the instruction live at RTL and conservatively prevents memory operations for the dims/qkv/output data from being reordered across the command.
 
 ### Step 5: Redirect control flow
 
@@ -1565,7 +1552,7 @@ Building this pass required solving 11 bugs, mostly related to GCC 15.2.0's inte
 
 **Root cause:** SSA base pointers from pattern matching are deep in address arithmetic chains. Calling `fold_convert()` on them caused segfaults.
 
-**Fix:** Instead of tracing SSA chains, use `DECL_ARGUMENTS` to get the original function parameters (`n`, `d`, `Q`, `K`, `V`) directly from the function declaration.
+**Fix:** Prefer candidate fields extracted during detection, with `DECL_ARGUMENTS` fallback for the original function parameters (`n`, `d`, `Q`, `K`, `V`, `out`).
 
 ### Fix 7: Header dependencies
 
@@ -1585,7 +1572,7 @@ Building this pass required solving 11 bugs, mostly related to GCC 15.2.0's inte
 
 **Fix:** Skip NULL and `error_mark_node` entries with `continue`, iterate up to 5000 entries.
 
-*Note: This fix is historical — the current implementation uses inline asm instead of the builtin call (Fix 11), so this code path is no longer used. But the fix remains in the code.*
+*Current implementation note: the replacement path uses this lookup so the GIMPLE pass can emit the real builtin call. The scan skips NULL and `error_mark_node` entries instead of stopping at the first gap.*
 
 ### Fix 9: Code inserted after terminating branch
 
@@ -1612,13 +1599,7 @@ Building this pass required solving 11 bugs, mostly related to GCC 15.2.0's inte
 
 **Root cause:** `__builtin_riscv_attn()` returns `unsigned long`, but the return value was never used. GCC's Dead Code Elimination pass saw the unused result and removed the entire call — even though the instruction has important side effects (it triggers a hardware accelerator).
 
-**Fix:** Switched from the builtin call to **volatile inline assembly**:
-
-```c
-asm volatile (".insn r 0x0b, 0, 0x01, x0, %0, %1" : : "r"(dims), "r"(qkv) : "memory");
-```
-
-Volatile asm is the one construct GCC **guarantees** it will never remove, regardless of optimization level. This fixed the issue permanently.
+**Fix:** Keep the builtin/RTL path side-effecting and observable. The pass assigns the builtin return value to a temporary and stores it into a generated volatile status local, so GIMPLE DCE keeps the call. The RTL pattern uses `unspec_volatile` plus a conservative memory clobber, so RTL DCE and scheduling preserve the accelerator command and its memory ordering.
 
 ---
 

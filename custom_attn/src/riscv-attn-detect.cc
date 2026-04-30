@@ -104,6 +104,28 @@ struct attn_candidate
  *  SECTION C: Helper functions for GIMPLE pattern matching
  * ═══════════════════════════════════════════════════════════════════ */
 
+static tree
+lookup_riscv_attn_builtin_decl ()
+{
+  const char *name = "__builtin_riscv_attn";
+
+  /* RISC-V target builtin tables can have NULL gaps, so scan a bounded range
+     and skip empty entries instead of stopping at the first missing slot.  */
+  for (unsigned code = 0; code < 5000; ++code)
+    {
+      tree decl = targetm.builtin_decl (code, true);
+      if (!decl || decl == error_mark_node)
+        continue;
+      if (TREE_CODE (decl) != FUNCTION_DECL || !DECL_NAME (decl))
+        continue;
+      if (strcmp (IDENTIFIER_POINTER (DECL_NAME (decl)), name) == 0)
+        return decl;
+    }
+
+  return NULL_TREE;
+}
+
+
 /* Return the nesting depth of LOOP (1 = single loop, 2 = doubly-nested, …).  */
 
 static int
@@ -1206,17 +1228,20 @@ build_qkv_struct (function *fun)
 /* Replace the four detected loop nests with a single __builtin_riscv_attn
    call.  This emits:
      1. Stack struct initialization (dims + qkv)
-     2. Memory barrier (volatile asm)
-     3. Call to __builtin_riscv_attn(&dims, &qkv)
-     4. Store result to output
+     2. Call to __builtin_riscv_attn(&dims, &qkv)
+     3. Volatile status store to keep the call observable in GIMPLE
    Then removes the four original loop nests.  */
 
 static void
 replace_attention_with_builtin (function *fun, struct attn_candidate *cand)
 {
-  /* We emit the attn instruction as inline assembly (.insn directive)
-     rather than going through __builtin_riscv_attn, so we don't need
-     to look up the builtin declaration here.  */
+  tree attn_builtin = lookup_riscv_attn_builtin_decl ();
+  if (!attn_builtin)
+    {
+      if (dump_file)
+        fprintf (dump_file, "  ERROR: cannot find __builtin_riscv_attn\n");
+      return;
+    }
 
   /* Extract dimensions and pointers from the candidate struct, which
      were populated during detection from loop trip counts and memory
@@ -1353,7 +1378,7 @@ replace_attention_with_builtin (function *fun, struct attn_candidate *cand)
     d_int);
   gsi_insert_after (&gsi, s4, GSI_NEW_STMT);
 
-  /* 2. Build qkv struct {Q, K, V} on stack  */
+  /* 2. Build qkv struct {Q, K, V, out} on stack  */
   tree qkv_var = build_qkv_struct (fun);
   tree qkv_type = TREE_TYPE (qkv_var);
   tree fq = TYPE_FIELDS (qkv_type);
@@ -1382,12 +1407,10 @@ replace_attention_with_builtin (function *fun, struct attn_candidate *cand)
     fold_convert (ptr_type, p_out));
   gsi_insert_after (&gsi, so, GSI_NEW_STMT);
 
-  /* 3. Volatile barrier  */
-  gasm *barrier = gimple_build_asm_vec ("", NULL, NULL, NULL, NULL);
-  gimple_asm_set_volatile (barrier, true);
-  gsi_insert_after (&gsi, barrier, GSI_NEW_STMT);
-
-  /* 4. Call __builtin_riscv_attn((ulong)&dims, (ulong)&qkv)  */
+  /* 3. Call __builtin_riscv_attn((ulong)&dims, (ulong)&qkv).  The target
+     builtin lowers through the riscv_attn RTL pattern, which is generated as
+     unspec_volatile with a memory clobber to model the accelerator command's
+     memory side effects.  */
   tree ul_type = long_unsigned_type_node;
 
   tree dims_addr_expr = build_fold_addr_expr (dims_var);
@@ -1403,54 +1426,27 @@ replace_attention_with_builtin (function *fun, struct attn_candidate *cand)
   gimple *gc2 = gimple_build_assign (qkv_tmp, qkv_cast);
   gsi_insert_after (&gsi, gc2, GSI_NEW_STMT);
 
-  /* The actual call — emit as inline assembly to guarantee the
-     instruction survives all optimization passes.  The .insn directive
-     encodes the R-type attn instruction directly.
+  tree attn_result = create_tmp_var (ul_type, "attn_result");
+  gcall *attn_call = gimple_build_call (attn_builtin, 2, dims_tmp, qkv_tmp);
+  gimple_call_set_lhs (attn_call, attn_result);
+  gsi_insert_after (&gsi, attn_call, GSI_NEW_STMT);
 
-     Encoding: .insn r 0x0b, 0, 0x01, x0, rs1, rs2
-       opcode=0x0b (custom-0), funct3=0, funct7=0x01
-       rd=x0 (unused), rs1=dims_addr, rs2=qkv_addr              */
-
-  tree ul_type_2 = long_unsigned_type_node;
-
-  /* Build: asm volatile (".insn r 0x0b, 0, 0x01, x0, %0, %1"
-                           : : "r"(dims_addr), "r"(qkv_addr) : "memory"); */
-
-  /* Input constraints: "r" for both operands  */
-  tree constraint_r = build_string (1, "r");
-
-  vec<tree, va_gc> *inputs = NULL;
-  /* First input: dims_addr  */
-  tree in1 = build_tree_list (
-    build_tree_list (NULL_TREE, constraint_r), dims_tmp);
-  vec_safe_push (inputs, in1);
-  /* Second input: qkv_addr  */
-  tree in2 = build_tree_list (
-    build_tree_list (NULL_TREE, constraint_r), qkv_tmp);
-  vec_safe_push (inputs, in2);
-
-  /* Clobbers: "memory"  */
-  vec<tree, va_gc> *clobbers = NULL;
-  tree mem_clobber = build_tree_list (NULL_TREE, build_string (6, "memory"));
-  vec_safe_push (clobbers, mem_clobber);
-
-  gasm *attn_asm = gimple_build_asm_vec (
-    ".insn r 0x0b, 0, 0x01, x0, %0, %1",
-    inputs,          /* inputs  */
-    NULL,            /* outputs  */
-    clobbers,        /* clobbers  */
-    NULL);           /* labels  */
-  gimple_asm_set_volatile (attn_asm, true);
-  gsi_insert_after (&gsi, attn_asm, GSI_NEW_STMT);
+  /* Keep the builtin result observable at the GIMPLE level.  The final
+     instruction side effects are modeled by the volatile RTL pattern.  */
+  tree volatile_ul_type = build_qualified_type (ul_type, TYPE_QUAL_VOLATILE);
+  tree status_var = create_tmp_var (volatile_ul_type, "attn_status");
+  TREE_THIS_VOLATILE (status_var) = 1;
+  gimple *status_store = gimple_build_assign (status_var, attn_result);
+  gsi_insert_after (&gsi, status_store, GSI_NEW_STMT);
 
   if (dump_file)
     {
-      fprintf (dump_file, "\n  Inserted attn instruction via inline asm:\n  ");
-      print_gimple_stmt (dump_file, attn_asm, 0, TDF_SLIM);
+      fprintf (dump_file, "\n  Inserted attn builtin/RTL instruction:\n  ");
+      print_gimple_stmt (dump_file, attn_call, 0, TDF_SLIM);
       fprintf (dump_file, "\n");
     }
 
-  /* 5. Redirect control flow: skip all 4 loops.
+  /* 4. Redirect control flow: skip all 4 loops.
 
      The split block (insert_bb) currently has exactly one successor —
      the first loop's header.  Redirect that edge to the exit block

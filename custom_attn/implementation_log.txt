@@ -60,7 +60,7 @@ File 7a: gcc/gcc/config/riscv/riscv-attn-detect.cc  [NEW]
   — Source: custom_attn/src/riscv-attn-detect.cc
   — Complete GIMPLE optimization pass (~1300 lines)
   — Detection: matmul → scale → softmax → matmul
-  — Replacement: emits attn via volatile inline asm (.insn directive)
+  — Replacement: emits __builtin_riscv_attn and lowers through side-effecting RTL
   — Registered dynamically via register_pass() after "loop" pass
 
 File 7b: gcc/gcc/config/riscv/t-riscv  [MODIFIED]
@@ -115,22 +115,22 @@ phase and performs the following:
 
 When all 4 stages are detected in sequence:
 
-1. Extract function parameters via DECL_ARGUMENTS:
-   — n (int), d (int), Q (float*), K (float*), V (float*)
+1. Extract function parameters via candidate fields or DECL_ARGUMENTS fallback:
+   — n (int), d (int), Q (float*), K (float*), V (float*), out (float*)
 
 2. Build dims struct on stack:
    — {rows=n, cols=n, seq_len=n, d_model=d}
 
 3. Build qkv struct on stack:
-   — {Q, K, V} (float pointers)
+   — {Q, K, V, out} (float pointers)
 
 4. Split preheader→loop1 edge via split_edge():
    — Creates a fresh basic block for the instruction
 
-5. Emit attn instruction via volatile inline assembly:
-   — .insn r 0x0b, 0, 0x01, x0, %0, %1
-   — Uses .insn directive (NOT __builtin_riscv_attn)
-   — Marked volatile to prevent DCE removal
+5. Emit __builtin_riscv_attn(dims_addr, qkv_addr):
+   — GCC lowers the builtin through the riscv_attn RTL pattern
+   — The generated RTL uses unspec_volatile and a memory clobber
+   — Result is stored to a generated volatile status local so GIMPLE DCE keeps it
 
 6. Find exit block via manual edge scanning:
    — single_exit(l4) may return NULL in GCC 15
@@ -196,8 +196,7 @@ FIX 8: Builtin lookup — NULL gaps in target builtin table
   valid builtins. The original iteration broke on the first NULL,
   never reaching __builtin_riscv_attn at index 506. Fixed by
   skipping NULL/error_mark_node entries with a 5000-entry upper
-  bound. (Note: this fix is historical — the current implementation
-  uses inline asm instead of the builtin call.)
+  bound. The current implementation uses this builtin lookup path.
 
 FIX 9: Control flow — code inserted after terminating branch
   gsi_last_bb(insert_bb) + gsi_insert_after placed the replacement
@@ -215,8 +214,10 @@ FIX 10: exit_bb NULL — single_exit() returns NULL
 FIX 11: DCE removes builtin call (unused result)
   __builtin_riscv_attn() returns unsigned long, but the result
   was never used. Dead Code Elimination removed the call entirely.
-  Fixed by switching to volatile inline assembly (.insn directive)
-  which is immune to all optimization passes including DCE.
+  Fixed by making the builtin/RTL path side-effecting and observable:
+  the GIMPLE pass stores the builtin result to a generated volatile
+  status local, and the RTL pattern uses unspec_volatile plus a
+  conservative memory clobber.
 
 
 ═══════════════════════════════════════════════════════════════

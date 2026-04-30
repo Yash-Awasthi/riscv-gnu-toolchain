@@ -21,7 +21,7 @@ One instruction replaces all four stages — matrix multiply, scale, softmax, an
 
 **Operands:**
 - `rs1`: address of dimensions struct `{int rows, cols, seq_len, d_model}`
-- `rs2`: address of Q/K/V pointers struct `{float *Q, float *K, float *V}`
+- `rs2`: address of operand pointers struct `{float *Q, float *K, float *V, float *out}`
 - `rd`: result/status register
 
 ---
@@ -39,8 +39,7 @@ A GCC optimization pass that scans your C code for the 4-stage attention loop pa
 and replaces all loops with the `attn` instruction automatically. No builtin call needed —
 write plain C loops and the compiler does the rest.
 
-Layer 1 is a **prerequisite** for Layer 2. The GIMPLE pass emits the instruction
-using its encoding, so the encoding must be registered first.
+Layer 1 is a **prerequisite** for Layer 2. The GIMPLE pass emits `__builtin_riscv_attn`, which lowers through the `riscv_attn` RTL pattern, so the builtin and encoding must be registered first.
 
 ### Using the Builtin (after Layer 1)
 
@@ -298,13 +297,13 @@ It processes every function in two phases:
 
 When all 4 stages match:
 
-1. Extracts function parameters (`n`, `d`, `Q`, `K`, `V`) via `DECL_ARGUMENTS`
+1. Extracts function parameters (`n`, `d`, `Q`, `K`, `V`, `out`) from candidate fields, with `DECL_ARGUMENTS` fallback
 2. Builds `dims` struct on stack: `{rows=n, cols=n, seq_len=n, d_model=d}`
-3. Builds `qkv` struct on stack: `{Q, K, V}` pointers
+3. Builds `qkv` struct on stack: `{Q, K, V, out}` pointers
 4. Splits the preheader → loop1 edge to create a fresh basic block
-5. Emits `attn` via volatile inline asm: `.insn r 0x0b, 0, 0x01, x0, rs1, rs2`
-   (volatile asm is immune to dead code elimination)
-6. Redirects control flow to the function exit, bypassing all 4 loops
+5. Emits `__builtin_riscv_attn(dims_addr, qkv_addr)`, which lowers through the side-effecting `riscv_attn` RTL pattern
+6. Stores the builtin status result to a generated volatile local so GIMPLE DCE keeps the call observable
+7. Redirects control flow to the function exit, bypassing all 4 loops
    (which become dead code and are cleaned up by GCC)
 
 ### GCC 15.2.0 Compatibility

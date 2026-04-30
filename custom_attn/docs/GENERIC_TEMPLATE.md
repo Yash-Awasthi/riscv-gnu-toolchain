@@ -163,9 +163,10 @@ The builtin will be callable as: `__builtin_riscv_your_insn(arg1, arg2)`
 ;; Integer operands version:
 (define_insn "riscv_your_insn"
   [(set (match_operand:DI 0 "register_operand" "=r")
-        (unspec:DI [(match_operand:DI 1 "register_operand" "r")
-                    (match_operand:DI 2 "register_operand" "r")]
-                   UNSPEC_YOUR_INSN))]
+        (unspec_volatile:DI [(match_operand:DI 1 "register_operand" "r")
+                             (match_operand:DI 2 "register_operand" "r")]
+                            UNSPEC_YOUR_INSN))
+   (clobber (mem:BLK (scratch)))]
   ""
   "your_insn\t%0,%1,%2"
   [(set_attr "type" "arith")
@@ -174,10 +175,11 @@ The builtin will be callable as: `__builtin_riscv_your_insn(arg1, arg2)`
 ;; Float operands version (3 inputs):
 (define_insn "riscv_your_insn"
   [(set (match_operand:SF 0 "register_operand" "=f")
-        (unspec:SF [(match_operand:SF 1 "register_operand" "f")
-                    (match_operand:SF 2 "register_operand" "f")
-                    (match_operand:SF 3 "register_operand" "f")]
-                   UNSPEC_YOUR_INSN))]
+        (unspec_volatile:SF [(match_operand:SF 1 "register_operand" "f")
+                             (match_operand:SF 2 "register_operand" "f")
+                             (match_operand:SF 3 "register_operand" "f")]
+                            UNSPEC_YOUR_INSN))
+   (clobber (mem:BLK (scratch)))]
   "TARGET_HARD_FLOAT"
   "your_insn\t%0,%1,%2,%3"
   [(set_attr "type" "fmadd")
@@ -206,7 +208,7 @@ make install
 ```c
 #include <stdint.h>
 
-/* NO inline assembly — use the compiler builtin directly */
+/* Use the compiler builtin directly. */
 unsigned long result = __builtin_riscv_your_insn(arg1, arg2);
 ```
 

@@ -369,7 +369,7 @@ def modify_riscv_builtins_cc(insn_name, num_inputs):
 
 
 def modify_riscv_md(insn_name, num_inputs):
-    """Add UNSPEC_<NAME> and define_insn pattern to riscv.md."""
+    """Add UNSPEC_<NAME> and side-effecting define_insn pattern to riscv.md."""
     text = RISCV_MD.read_text()
     upper = insn_name.upper()
     unspec_name = f"UNSPEC_{upper}"
@@ -399,17 +399,18 @@ def modify_riscv_md(insn_name, num_inputs):
             operands.append(f'(match_operand:DI {i} "register_operand" "r")')
 
         if num_inputs == 0:
-            unspec_body = f"(unspec:DI [] {unspec_name})"
+            unspec_body = f"(unspec_volatile:DI [] {unspec_name})"
         else:
             inner = "\n                                ".join(operands)
-            unspec_body = f"(unspec:DI [{inner}]\n                               {unspec_name})"
+            unspec_body = f"(unspec_volatile:DI [{inner}]\n                                        {unspec_name})"
 
         insn_pattern = textwrap.dedent(f'''\
 
             ;; Custom Instruction — {insn_name} {MARKER}
             (define_insn "{pattern_name}"
               [(set (match_operand:DI 0 "register_operand" "=r")
-                    {unspec_body})]
+                    {unspec_body})
+               (clobber (mem:BLK (scratch)))]
               ""
               "{insn_name}\\t{cfg['asm_operands']}"
               [(set_attr "type" "arith")
@@ -941,7 +942,7 @@ def save_reference_copies(insn_name, num_inputs, match_val, mask_val):
 
     --- riscv.md ---
     UNSPEC_{upper}  (in define_c_enum "unspec")
-    define_insn "riscv_{insn_name}" → "{insn_name}\\t{cfg['asm_operands']}"
+    define_insn "riscv_{insn_name}" → side-effecting "{insn_name}\\t{cfg['asm_operands']}"
 
     --- riscv-opcodes/extensions/rv_custom ---
     {insn_name} rd ... 6..2=<base> 1..0=3

@@ -382,10 +382,10 @@ modify_riscv_md() {
 
     local operands=""
     case "$ni" in
-        0) operands="(unspec:DI [] ${unspec})" ;;
-        1) operands="(unspec:DI [(match_operand:DI 1 \"register_operand\" \"r\")]\n                               ${unspec})" ;;
-        2) operands="(unspec:DI [(match_operand:DI 1 \"register_operand\" \"r\")\n                                (match_operand:DI 2 \"register_operand\" \"r\")]\n                               ${unspec})" ;;
-        3) operands="(unspec:DI [(match_operand:DI 1 \"register_operand\" \"r\")\n                                (match_operand:DI 2 \"register_operand\" \"r\")\n                                (match_operand:DI 3 \"register_operand\" \"r\")]\n                               ${unspec})" ;;
+        0) operands="(unspec_volatile:DI [] ${unspec})" ;;
+        1) operands="(unspec_volatile:DI [(match_operand:DI 1 \"register_operand\" \"r\")]\n                                        ${unspec})" ;;
+        2) operands="(unspec_volatile:DI [(match_operand:DI 1 \"register_operand\" \"r\")\n                                (match_operand:DI 2 \"register_operand\" \"r\")]\n                                        ${unspec})" ;;
+        3) operands="(unspec_volatile:DI [(match_operand:DI 1 \"register_operand\" \"r\")\n                                (match_operand:DI 2 \"register_operand\" \"r\")\n                                (match_operand:DI 3 \"register_operand\" \"r\")]\n                                        ${unspec})" ;;
     esac
 
     cat >> "$RISCV_MD" << ENDOFMD
@@ -393,7 +393,8 @@ modify_riscv_md() {
 ;; Custom Instruction — ${name} ${MARKER}
 (define_insn "riscv_${name}"
   [(set (match_operand:DI 0 "register_operand" "=r")
-        $(echo -e "$operands"))]
+        $(echo -e "$operands"))
+   (clobber (mem:BLK (scratch)))]
   ""
   "${name}\t${asm_ops}"
   [(set_attr "type" "arith")

@@ -96,11 +96,12 @@ typedef struct {
     int d_model;   /* full model embedding dimension  */
 } attn_dims_t;
 
-/* Struct 2: Q/K/V matrix pointers */
+/* Struct 2: operand matrix pointers */
 typedef struct {
     float *Q;      /* Query  matrix pointer */
     float *K;      /* Key    matrix pointer */
     float *V;      /* Value  matrix pointer */
+    float *out;    /* Output matrix pointer */
 } attn_qkv_t;
 ```
 

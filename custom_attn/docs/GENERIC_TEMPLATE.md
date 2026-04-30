@@ -243,3 +243,76 @@ od -An -tx4 -w4 -v test.bin > hexdump.txt
 
 After modifying these 6 files, rebuild the toolchain and your custom
 instruction will be available as `__builtin_riscv_your_insn()` in C code.
+
+---
+
+## Automation: Add a New Instruction in One Command
+
+Instead of editing the 6 files manually, use the automation scripts in
+`custom_attn/scripts/`:
+
+```bash
+# Add a 2-input instruction (R-type, rd rs1 rs2)
+./automate_instruction.sh add my_pow 2 "(a^b)^a"
+
+# Preview what would be changed without writing anything (--dry-run)
+./automate_instruction.sh add my_pow 2 "(a^b)^a" --dry-run
+
+# Add multiple instructions at once (from a batch file)
+./automate_instruction.sh batch instructions_example.txt
+
+# Verify that all 6 files were patched correctly
+./verify_patch.sh my_pow
+
+# Or using the verify subcommand
+./automate_instruction.sh verify my_pow
+
+# List all auto-generated instructions currently in the toolchain
+./automate_instruction.sh list
+
+# Scan free opcode slots for 2-input instructions
+./automate_instruction.sh scan 2
+
+# Remove an instruction and its demo files
+./automate_instruction.sh delete my_pow
+```
+
+Input count meanings:
+| Count | Format  | Registers          | Use case                        |
+|-------|---------|--------------------|---------------------------------|
+| 0     | R-type  | rd only            | Read a hardware register        |
+| 1     | R-type  | rd, rs1            | Unary op / array address        |
+| 2     | R-type  | rd, rs1, rs2       | Binary op / two array addresses |
+| 3     | R4-type | rd, rs1, rs2, rs3  | Ternary op (e.g., fused MAC)    |
+
+After `add`, the script generates:
+- `demo/main_<name>.c` — runnable C demo (compiles to full executable with newlib)
+- `demo/build_<name>.sh` — compile + run + verify script
+
+---
+
+## Verification Workflow (for Screenshots / Submission)
+
+```bash
+# 1. Compile to object (no newlib needed — for instruction screenshot)
+riscv64-unknown-elf-gcc -O2 -march=rv64gc -mabi=lp64d \
+    -c demo_attn.c -o demo_attn.o
+
+# 2. Show the custom instruction in disassembly
+riscv64-unknown-elf-objdump -d demo_attn.o | grep -A2 -B2 "attn"
+
+# 3. Generate assembly listing (shows attn in .s file)
+riscv64-unknown-elf-gcc -O2 -march=rv64gc -mabi=lp64d \
+    -S demo_attn.c -o demo_attn.s
+grep "attn" demo_attn.s
+
+# 4. Full executable + run
+riscv64-unknown-elf-gcc -O2 -march=rv64gc -mabi=lp64d \
+    demo_attn.c -o demo_attn -lm
+qemu-riscv64 ./demo_attn
+```
+
+Expected output in disassembly:
+```
+30:  02e7800b    attn  zero,a5,a4
+```

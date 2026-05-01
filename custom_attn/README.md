@@ -323,13 +323,18 @@ When all 4 stages match:
 6. Redirects control flow to the function exit, bypassing all 4 loops
    (which become dead code and are cleaned up by GCC)
 
-> **Current implementation:** Steps 1–3 above (building `dims`/`qkv` structs and
-> passing pointer arguments) represent the full hardware contract.  The current
-> `riscv-attn-detect.cc` emits a simpler form: a single `volatile` inline asm
-> `.word 0x0200000b` with a `"memory"` clobber.  The instruction encoding alone
-> identifies the operation; the hardware reads the matrix pointers from its own
-> micro-architectural state.  The struct-building code is documented here as the
-> intended calling convention for a full hardware implementation.
+> **Implementation:** Steps 1–3 are fully implemented in `riscv-attn-detect.cc`.
+> The pass builds two flat arrays on the stack:
+> - `unsigned long __attn_dims[2]` → `{ seq_len, d_model }`
+> - `unsigned long __attn_qkv[4]`  → `{ Q, K, V, out }` (pointers cast to `unsigned long`)
+>
+> These are marked `TREE_ADDRESSABLE` (must live on the stack, not in registers).
+> Their addresses become `rs1` and `rs2` of the instruction:
+> ```
+> .insn r 0x0b, 0, 0x01, x0, %0, %1   // rs1=&dims, rs2=&qkv
+> ```
+> A SPIKE or hardware implementation reads `rs1[0]`=seq_len, `rs1[1]`=d_model,
+> `rs2[0]`=Q, `rs2[1]`=K, `rs2[2]`=V, `rs2[3]`=out.
 
 ### GCC 15.2.0 Compatibility
 

@@ -552,7 +552,7 @@ Three changes applied together in `replace_attention_with_builtin`:
 | 3 | `riscv-ftypes.def`, `riscv-builtins.cc`, `riscv.md` | Script silently skipped GCC files; wrong type `DI` vs `UDI` | Fixed |
 | 4 | `riscv-attn-detect.cc` | Unconditional `scev_initialize` ICE | Fixed |
 | 5 | `riscv-attn-detect.cc` | `TODO_cleanup_cfg` triggers post-loop SSA crash | Fixed |
-| 6 | `riscv-attn-detect.cc` | Dangling SSA uses after BB removal | Disabled (future work) |
+| 6 | `riscv-attn-detect.cc` | Dangling SSA uses after BB removal | Fixed |
 | 7 | `passes.def` | Pass placed outside GIMPLE loop group | Fixed |
 | 8 | `t-riscv` | Duplicate `-o` flag / wrong recipe | Fixed |
 | 9 | `config.gcc` | Missing `extra_objs` entry | Fixed |

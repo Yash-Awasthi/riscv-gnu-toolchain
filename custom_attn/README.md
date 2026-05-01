@@ -252,8 +252,9 @@ riscv64-unknown-elf-objdump -d mainloops.o
 riscv64-unknown-elf-gcc -O2 -march=rv64gc -mabi=lp64d \
     -ffreestanding -nostdlib -c custom_attn/demo/mainloops.c -o mainloops.o \
     -fdump-tree-all-details
-grep "ATTENTION PATTERN DETECTED" mainloops.c.*riscv_attn_detect
-# Expected: *** ATTENTION PATTERN DETECTED ***
+grep "PATTERN DETECTED" mainloops.c.*riscv_attn_detect
+# Expected: *** 3-LOOP ATTENTION PATTERN DETECTED ***
+# (3 top-level loops at -O2; matmul+scale are fused by the optimizer)
 ```
 
 ---
@@ -294,6 +295,21 @@ It processes every function in two phases:
 | 3 | `is_softmax_pattern()` | Outer loop with 2–3 child loops (exp+sum, normalize) |
 | 4 | `is_matmul_pattern()` | Triple-nested loop (scores × V) |
 
+> **Implementation note — 3 top-level loops at `-O2`:** When compiled with `-O2`,
+> GCC fuses the scale operation (`/ sqrt(d_k)`) directly into the first matmul loop.
+> The pass therefore detects **3 top-level loops** in practice, not 4 separate ones:
+>
+> | Window | Pattern |
+> |--------|---------|
+> | Loop 1 | `is_matmul_pattern()` — matmul + scale fused (Q×Kᵀ and divide in one loop nest) |
+> | Loop 2 | `is_softmax_pattern()` — exp, sum, normalize per row |
+> | Loop 3 | `is_matmul_pattern()` — scores × V → output |
+>
+> Dump output confirms: `*** 3-LOOP ATTENTION PATTERN DETECTED ***`
+> with `Loops: 1 (matmul+scale fused) -> 2 (softmax) -> 3 (matmul2)`.
+> See `test/test2.c` for the working fused-scale C source and `test/attn_detect.dump`
+> for the full pass trace.
+
 ### Replacement
 
 When all 4 stages match:
@@ -306,6 +322,14 @@ When all 4 stages match:
    (volatile asm is immune to dead code elimination)
 6. Redirects control flow to the function exit, bypassing all 4 loops
    (which become dead code and are cleaned up by GCC)
+
+> **Current implementation:** Steps 1–3 above (building `dims`/`qkv` structs and
+> passing pointer arguments) represent the full hardware contract.  The current
+> `riscv-attn-detect.cc` emits a simpler form: a single `volatile` inline asm
+> `.word 0x0200000b` with a `"memory"` clobber.  The instruction encoding alone
+> identifies the operation; the hardware reads the matrix pointers from its own
+> micro-architectural state.  The struct-building code is documented here as the
+> intended calling convention for a full hardware implementation.
 
 ### GCC 15.2.0 Compatibility
 
@@ -337,6 +361,9 @@ custom_attn/
 │   └── instructions_example.txt       # Batch input example
 └── docs/
     ├── DOCUMENTATION.md               # Full beginner-friendly documentation
+    ├── BUILD_GUIDE.md                 # Step-by-step build guide (WSL / Ubuntu)
+    ├── KNOWN_ISSUES.md                # All 11 issues and their fixes
+    ├── MANUAL_PATCHES.md              # Manual patch reference for each GCC/binutils file
     ├── GENERIC_TEMPLATE.md            # Template for adding other custom instructions
     └── OPCODE_FIELDS.md              # Opcode field specifications
 ```

@@ -302,6 +302,46 @@ Completing the CFG replacement is marked as future work.
 
 ---
 
+### Resolution (implemented)
+
+> **UPDATE:** This issue is **fully resolved** in the current implementation.
+> CFG replacement is working — see the fix details below.
+
+The root cause (dangling SSA uses after loop BB removal) was fixed by the following
+combined approach applied inside `replace_attention_with_builtin`:
+
+1. **`loops_state_clear(LOOP_CLOSED_SSA)`** — prevents `repair_loop_structures` from
+   attempting to rewrite loop-closed SSA for the dead loop BBs after removal.
+
+2. **`free_dominance_info(CDI_DOMINATORS)` + `free_dominance_info(CDI_POST_DOMINATORS)`**
+   — invalidates stale dominator information so `update_ssa` recomputes from scratch
+   on the post-redirect CFG rather than trying to patch inconsistent info.
+
+3. **`mark_virtual_operands_for_renaming(cfun)`** — forces the virtual SSA chain to
+   be rethreaded so the exit block's VUSE connects to the asm's VDEF, not to a deleted BB.
+
+4. **Memory clobber on the inline asm** — the `"memory"` clobber creates a VDEF in
+   the new block that anchors the virtual operand chain after loop BBs are removed.
+
+5. **Return `TODO_cleanup_cfg | TODO_update_ssa` from `execute()`** — `cleanup_cfg`
+   removes the now-unreachable loop BBs first; only then does `update_ssa` run on the
+   clean CFG. Putting both flags in `todo_flags_finish` crashed because DCE ran before
+   cleanup.
+
+Verified output (`test/test2_attn.s`):
+```
+attention:
+        ble     a4,zero,.L1
+ #APP
+        .word 0x0200000b
+ #NO_APP
+.L1:
+        ret
+```
+39 loop basic blocks removed. Function collapsed from ~50 BBs to 3 BBs.
+
+---
+
 ## Issue 7 — Wrong placement of pass in `passes.def`
 
 **File:** `gcc/gcc/passes.def`
@@ -430,6 +470,79 @@ extra_objs="riscv-builtins.o riscv-c.o riscv-sr.o riscv-string.o \
 
 ---
 
+---
+
+## Issue 10 — ICE in `calc_dfs_tree` after loop BB removal
+
+**File:** `gcc/gcc/config/riscv/riscv-attn-detect.cc` (Section E — replacement)
+
+### Symptom
+
+```
+during GIMPLE pass: riscv_attn_detect
+internal compiler error: in calc_dfs_tree, at dominance.cc:...
+```
+
+### Root cause
+
+After `redirect_edge_and_branch()` redirected the edge away from the loop BBs,
+the loop headers were still present in the CFG but unreachable. When `update_ssa`
+subsequently called `calculate_dominance_info()`, the DFS traversal crashed on
+the inconsistent (unreachable-but-present) nodes.
+
+### Fix
+
+Call `free_dominance_info(CDI_DOMINATORS)` and `free_dominance_info(CDI_POST_DOMINATORS)`
+before returning from `replace_attention_with_builtin()`. This forces `calculate_dominance_info`
+to rebuild the dominator tree from scratch rather than updating the stale one.
+
+---
+
+## Issue 11 — DCE crash `mark_operand_necessary: bb == NULL`
+
+**File:** `gcc/gcc/config/riscv/riscv-attn-detect.cc` (Section E — replacement)
+
+### Symptom
+
+After a successful detection and CFG redirect, the subsequent Dead Code Elimination pass crashed:
+
+```
+during GIMPLE pass: dce
+internal compiler error: in mark_operand_necessary, at tree-ssa-dce.cc:...
+```
+
+### Root cause
+
+SSA names defined inside the now-dead loop BBs had `GIMPLE_BB(stmt) == NULL` after
+cleanup removed the BBs. When DCE walked the use-def chains to mark operands as necessary,
+it dereferenced the NULL basic block pointer.
+
+The virtual operand chain (VUSE/VDEF) was also broken — the exit block's VUSE could
+not trace back through the chain because the defining VDEF was in a deleted BB.
+
+### Fix
+
+Three changes applied together in `replace_attention_with_builtin`:
+
+1. **Memory clobber on the asm** — adds a VDEF in the new insert block that anchors
+   the virtual operand chain going forward:
+   ```cpp
+   vec<tree, va_gc> *clobbers = NULL;
+   tree mem_clob = build_tree_list(NULL_TREE, build_string(7, "memory"));
+   vec_safe_push(clobbers, mem_clob);
+   gasm *attn_asm = gimple_build_asm_vec(".word 0x0200000b", NULL, NULL, clobbers, NULL);
+   gimple_asm_set_volatile(attn_asm, true);
+   ```
+
+2. **`mark_virtual_operands_for_renaming(cfun)`** — forces `update_ssa` to rethread
+   all VUSEs in the exit block to the asm's VDEF instead of the deleted loop BBs' VDEFs.
+
+3. **`TODO_cleanup_cfg | TODO_update_ssa` returned from `execute()`** — cleanup_cfg
+   removes the dead BBs first, giving `update_ssa` a consistent CFG to work from.
+   (Moving `TODO_cleanup_cfg` out of `todo_flags_finish` and into the `execute()` return
+   value is essential — `todo_flags_finish` runs cleanup after SSA has already processed
+   the stale BBs.)
+
 ## Summary table
 
 | # | File(s) | Root cause | Status |
@@ -443,3 +556,5 @@ extra_objs="riscv-builtins.o riscv-c.o riscv-sr.o riscv-string.o \
 | 7 | `passes.def` | Pass placed outside GIMPLE loop group | Fixed |
 | 8 | `t-riscv` | Duplicate `-o` flag / wrong recipe | Fixed |
 | 9 | `config.gcc` | Missing `extra_objs` entry | Fixed |
+| 10 | `riscv-attn-detect.cc` | ICE in `calc_dfs_tree` — stale dominance info | Fixed |
+| 11 | `riscv-attn-detect.cc` | DCE crash `bb==NULL` — broken virtual operand chain | Fixed |

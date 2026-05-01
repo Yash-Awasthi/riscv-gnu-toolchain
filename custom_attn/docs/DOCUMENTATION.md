@@ -1316,12 +1316,16 @@ asm volatile (".insn r 0x0b, 0, 0x01, x0, %0, %1"
               : "memory");
 ```
 
-> **Current implementation note:** The `riscv-attn-detect.cc` source uses a simpler
-> asm form — just `.word 0x0200000b` (no operand constraints) with a `"memory"` clobber.
-> The `.insn r ...` form with explicit `%0`/`%1` operands (shown above) is the intended
-> calling convention for a full hardware implementation where the hardware needs the
-> address of the dims and qkv structs. Both forms emit the same 32-bit encoding
-> (`0x0200000b`) in the final binary.
+> **Implementation detail:** The pass builds two flat arrays on the stack using
+> `build_decl` + `TREE_ADDRESSABLE` + `add_local_decl`:
+> - `unsigned long __attn_dims[2]` — element 0 = `seq_len`, element 1 = `d_model`
+> - `unsigned long __attn_qkv[4]`  — elements 0–3 = `Q`, `K`, `V`, `out` (pointers
+>   cast to `unsigned long` via `fold_convert`)
+>
+> The addresses are loaded into SSA temporaries via `make_ssa_name` + `create_tmp_reg`
+> and passed as `%0` (rs1) and `%1` (rs2) to the asm.
+> A SPIKE plugin or hardware implementation reads:
+> `rs1[0]`=seq_len, `rs1[1]`=d_model, `rs2[0..3]`={Q,K,V,out}.
 
 The `.insn r` directive tells the assembler to encode an R-type instruction with:
 - opcode = `0x0b` (custom-0)
@@ -1510,7 +1514,7 @@ Expected output (key section):
 
 **No loop code at all.** The compiler:
 1. Detected the 3-loop attention pattern (matmul+scale fused at `-O2`)
-2. Built the dims and qkv structs on the stack from the function arguments _(struct-building is the full hardware contract; current implementation emits the instruction directly)_
+2. Built `__attn_dims[2]={seq_len,d_model}` and `__attn_qkv[4]={Q,K,V,out}` on the stack
 3. Emitted a single `attn` instruction
 4. Eliminated all original loop code
 

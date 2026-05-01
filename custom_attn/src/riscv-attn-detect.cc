@@ -1315,45 +1315,170 @@ build_qkv_struct (function *fun)
 static void
 replace_attention_with_builtin (function *fun, struct attn_candidate *cand)
 {
-  /* Use the loop preheader edge — always exists at -O2 and avoids
-     having to search for the edge from orig_bb to loop1_header.  */
+  /* ---- 1. Extract operand trees from the candidate struct.
+     seq_len / d_model come from loop trip counts.
+     q_base / k_base / v_base / output_base come from memory-access
+     patterns detected in the detection phase.
+     If any field is NULL, fall back to DECL_ARGUMENTS.            ---- */
+  tree p_n   = cand->seq_len;
+  tree p_d   = cand->d_model;
+  tree p_Q   = cand->q_base;
+  tree p_K   = cand->k_base;
+  tree p_V   = cand->v_base;
+  tree p_out = cand->output_base;
+
+  /* Fallback: walk function parameter chain.
+     Expected signature:
+       attention(float *Q, float *K, float *V, float *out,
+                 int seq_len, int d_k, int d_v)            */
+  if (!p_n || !p_d || !p_Q || !p_K || !p_V || !p_out)
+    {
+      if (dump_file)
+        fprintf (dump_file,
+                 "  Candidate fields incomplete, falling back to "
+                 "DECL_ARGUMENTS\n");
+      tree a = DECL_ARGUMENTS (fun->decl);
+      if (a && DECL_CHAIN (a) && DECL_CHAIN (DECL_CHAIN (a))
+          && DECL_CHAIN (DECL_CHAIN (DECL_CHAIN (a)))
+          && DECL_CHAIN (DECL_CHAIN (DECL_CHAIN (DECL_CHAIN (a))))
+          && DECL_CHAIN (DECL_CHAIN (DECL_CHAIN (DECL_CHAIN (DECL_CHAIN (a))))))
+        {
+          if (!p_Q)   p_Q   = a;  a = DECL_CHAIN (a);
+          if (!p_K)   p_K   = a;  a = DECL_CHAIN (a);
+          if (!p_V)   p_V   = a;  a = DECL_CHAIN (a);
+          if (!p_out) p_out = a;  a = DECL_CHAIN (a);
+          if (!p_n)   p_n   = a;  a = DECL_CHAIN (a);
+          if (!p_d)   p_d   = a;
+        }
+    }
+
+  if (!p_n || !p_d || !p_Q || !p_K || !p_V || !p_out)
+    {
+      if (dump_file)
+        fprintf (dump_file,
+                 "  ERROR: cannot extract parameters, aborting.\n");
+      return;
+    }
+
+  /* ---- 2. CFG: split the preheader->loop1_header edge to get a
+     clean, empty basic block for our inserted code.              ---- */
   edge loop_entry_edge = loop_preheader_edge (cand->matmul1_loop);
   if (!loop_entry_edge)
     {
       if (dump_file)
-        fprintf (dump_file, "  ERROR: no preheader edge for matmul1 loop\n");
+        fprintf (dump_file,
+                 "  ERROR: no preheader edge for matmul1 loop\n");
       return;
     }
-
-  /* Split the preheader->header edge to get a clean insertion block.  */
   basic_block insert_bb = split_edge (loop_entry_edge);
-
-  /* Build memory clobber so the asm anchors the virtual-operand chain.
-     Without this, cleanup_tree_cfg leaves dangling vdef/vuse refs that
-     crash DCE and FRE.  */
-  vec<tree, va_gc> *clobbers = NULL;
-  tree mem_clob = build_tree_list (NULL_TREE, build_string (7, "memory"));
-  vec_safe_push (clobbers, mem_clob);
-
-  /* Emit the attn R-type instruction.
-     Encoding: opcode=0x0b, funct3=0, funct7=0x01, rd=x0 => 0x0200000b  */
-  gasm *attn_asm = gimple_build_asm_vec (
-    ".word 0x0200000b",
-    NULL,      /* inputs   */
-    NULL,      /* outputs  */
-    clobbers,  /* clobbers */
-    NULL);     /* labels   */
-  gimple_asm_set_volatile (attn_asm, true);
-
   gimple_stmt_iterator gsi = gsi_start_bb (insert_bb);
-  gsi_insert_before (&gsi, attn_asm, GSI_SAME_STMT);
 
-  /* Register virtual operands for the new asm stmt so update_ssa
-     knows about the VDEF it produces.  */
-  update_stmt (attn_asm);
+  tree ul_type = long_unsigned_type_node;   /* unsigned long — 8 bytes on rv64  */
 
-  /* Redirect insert_bb to exit_bb, making all loop BBs unreachable.
-     cleanup_tree_cfg (via TODO_cleanup_cfg) will remove them.  */
+  /* ---- 3. Build dims array on the stack:
+       unsigned long __attn_dims[2] = { seq_len, d_model }
+     The hardware reads:
+       rs1[0] = number of rows/columns (sequence length)
+       rs1[1] = key/query dimension (d_k)                         ---- */
+  tree dims_arr_type = build_array_type_nelts (ul_type, 2);
+  tree dims_var = build_decl (UNKNOWN_LOCATION, VAR_DECL,
+                              get_identifier ("__attn_dims"),
+                              dims_arr_type);
+  DECL_CONTEXT    (dims_var) = fun->decl;
+  DECL_ARTIFICIAL (dims_var) = 1;
+  DECL_IGNORED_P  (dims_var) = 1;
+  TREE_STATIC     (dims_var) = 0;
+  TREE_ADDRESSABLE(dims_var) = 1;   /* must live on the stack  */
+  add_local_decl (fun, dims_var);
+
+#define EMIT(stmt_) do {                                       \
+    gimple *_s = (stmt_);                                      \
+    gsi_insert_before (&gsi, _s, GSI_SAME_STMT);              \
+    update_stmt (_s);                                          \
+  } while (0)
+
+  EMIT (gimple_build_assign (
+    build4 (ARRAY_REF, ul_type, dims_var, size_int (0), NULL_TREE, NULL_TREE),
+    fold_convert (ul_type, p_n)));
+
+  EMIT (gimple_build_assign (
+    build4 (ARRAY_REF, ul_type, dims_var, size_int (1), NULL_TREE, NULL_TREE),
+    fold_convert (ul_type, p_d)));
+
+  /* ---- 4. Build qkv array on the stack:
+       unsigned long __attn_qkv[4] = { Q, K, V, out }
+     The hardware reads pointer-sized words; the pointer value is
+     cast to unsigned long so GIMPLE does not need to know the
+     pointee type of each slot.                                    ---- */
+  tree qkv_arr_type = build_array_type_nelts (ul_type, 4);
+  tree qkv_var = build_decl (UNKNOWN_LOCATION, VAR_DECL,
+                             get_identifier ("__attn_qkv"),
+                             qkv_arr_type);
+  DECL_CONTEXT    (qkv_var) = fun->decl;
+  DECL_ARTIFICIAL (qkv_var) = 1;
+  DECL_IGNORED_P  (qkv_var) = 1;
+  TREE_STATIC     (qkv_var) = 0;
+  TREE_ADDRESSABLE(qkv_var) = 1;
+  add_local_decl (fun, qkv_var);
+
+  tree ptrs[4] = { p_Q, p_K, p_V, p_out };
+  for (int i = 0; i < 4; i++)
+    EMIT (gimple_build_assign (
+      build4 (ARRAY_REF, ul_type, qkv_var,
+              size_int (i), NULL_TREE, NULL_TREE),
+      fold_convert (ul_type, ptrs[i])));
+
+  /* ---- 5. Load the array addresses into SSA temporaries.
+     build_fold_addr_expr also calls mark_addressable internally,
+     confirming that dims_var/qkv_var must not be kept in registers. ---- */
+  tree dims_addr_tmp = create_tmp_reg (ul_type, "dims_addr");
+  tree dims_addr_ssa = make_ssa_name (dims_addr_tmp);
+  EMIT (gimple_build_assign (
+    dims_addr_ssa,
+    fold_convert (ul_type, build_fold_addr_expr (dims_var))));
+
+  tree qkv_addr_tmp = create_tmp_reg (ul_type, "qkv_addr");
+  tree qkv_addr_ssa = make_ssa_name (qkv_addr_tmp);
+  EMIT (gimple_build_assign (
+    qkv_addr_ssa,
+    fold_convert (ul_type, build_fold_addr_expr (qkv_var))));
+
+  /* ---- 6. Emit the attn instruction as volatile inline asm.
+     Encoding: R-type, opcode=0x0b (custom-0), funct3=0, funct7=0x01
+       .insn r 0x0b, 0, 0x01, x0, rs1, rs2
+     rs1 (%0) = address of dims array  { seq_len, d_model }
+     rs2 (%1) = address of qkv array   { Q, K, V, out }
+     rd       = x0 (unused / status)
+     "memory" clobber: anchors the virtual-operand chain and
+     prevents the optimizer from reordering the stores above.     ---- */
+  tree constraint_r = build_string (1, "r");
+
+  vec<tree, va_gc> *inputs = NULL;
+  vec_safe_push (inputs,
+    build_tree_list (build_tree_list (NULL_TREE, constraint_r),
+                     dims_addr_ssa));
+  vec_safe_push (inputs,
+    build_tree_list (build_tree_list (NULL_TREE, constraint_r),
+                     qkv_addr_ssa));
+
+  vec<tree, va_gc> *clobbers = NULL;
+  vec_safe_push (clobbers,
+    build_tree_list (NULL_TREE, build_string (7, "memory")));
+
+  gasm *attn_asm = gimple_build_asm_vec (
+    ".insn r 0x0b, 0, 0x01, x0, %0, %1",
+    inputs,   /* inputs   */
+    NULL,     /* outputs  */
+    clobbers, /* clobbers */
+    NULL);    /* labels   */
+  gimple_asm_set_volatile (attn_asm, true);
+  EMIT (attn_asm);
+
+#undef EMIT
+
+  /* ---- 7. Redirect insert_bb to exit_bb, making all loop BBs
+     unreachable.  TODO_cleanup_cfg (returned from execute()) will
+     call cleanup_tree_cfg() to remove them.                       ---- */
   if (cand->exit_bb)
     {
       edge e;
@@ -1371,23 +1496,20 @@ replace_attention_with_builtin (function *fun, struct attn_candidate *cand)
   else if (dump_file)
     fprintf (dump_file, "  WARNING: exit_bb NULL, CFG not redirected\n");
 
-  /* Tell GCC the loop-closed SSA form is gone (loops are dead) so
-     repair_loop_structures does not try to rewrite it.  */
+  /* ---- 8. SSA / dominator cleanup ---- */
   loops_state_clear (LOOP_CLOSED_SSA);
-
-  /* Force virtual-operand renaming: after cleanup_tree_cfg removes the
-     dead loop BBs, update_ssa must recompute the vdef/vuse chain so
-     that the exit block's VUSE reaches the asm's VDEF, not a
-     now-deleted loop stmt.  */
   mark_virtual_operands_for_renaming (cfun);
-
   free_dominance_info (CDI_DOMINATORS);
   free_dominance_info (CDI_POST_DOMINATORS);
 
   if (dump_file)
     fprintf (dump_file,
-             "  Inserted .word 0x0200000b + bypassed all loops.\n"
-             "  Attention pattern replaced successfully.\n\n");
+             "  Emitted: .insn r 0x0b,0,0x01,x0,%%0,%%1\n"
+             "    rs1 = &dims { seq_len=%p, d_model=%p }\n"
+             "    rs2 = &qkv  { Q=%p, K=%p, V=%p, out=%p }\n"
+             "  Attention pattern replaced successfully.\n\n",
+             (void *)p_n, (void *)p_d,
+             (void *)p_Q, (void *)p_K, (void *)p_V, (void *)p_out);
 }
 
 

@@ -379,6 +379,10 @@ find_matmul_reduction (class loop *innermost,
           /* Look for: _x = _y + _z  where _z = _a * _b  */
           if (code == PLUS_EXPR)
             {
+              /* Skip integer arithmetic — only match float/double accumulations. */
+              tree _lhs = gimple_assign_lhs (stmt);
+              if (!SCALAR_FLOAT_TYPE_P (TREE_TYPE (_lhs)))
+                continue;
               tree rhs1 = gimple_assign_rhs1 (stmt);
               tree rhs2 = gimple_assign_rhs2 (stmt);
 
@@ -685,9 +689,12 @@ is_softmax_pattern (class loop *loop, tree *arr_base)
   class loop *child1, *child2, *child3;
   if (nchildren == 3)
     {
-      child1 = loop->inner;
-      child2 = child1->next;
-      child3 = child2->next;
+      /* GCC lists sibling loops in reverse program order.
+         loop->inner = last loop in program order (normalize).
+         Reverse: child1=max, child2=exp-sum, child3=normalize.  */
+      child3 = loop->inner;
+      child2 = child3->next;
+      child1 = child2->next;
     }
   else
     {
@@ -881,8 +888,12 @@ static bool
 detect_attention_pattern (function *fun, struct attn_candidate *cand)
 {
   /* Initialize loop infrastructure  */
-  loop_optimizer_init (LOOPS_NORMAL);
-  scev_initialize ();
+  bool local_loop_init = (loops_for_fn (fun) == NULL);
+  if (local_loop_init)
+    loop_optimizer_init (LOOPS_NORMAL);
+  bool local_scev_init = local_loop_init;
+  if (local_scev_init)
+    scev_initialize ();
 
   bool detected = false;
 
@@ -910,7 +921,7 @@ detect_attention_pattern (function *fun, struct attn_candidate *cand)
   if (dump_file)
     fprintf (dump_file, "  Found %u top-level loop(s)\n", top_loops.length ());
 
-  if (top_loops.length () < 4)
+  if (top_loops.length () < 3)
     goto cleanup;
 
   /* Try each window of 4 consecutive top-level loops  */
@@ -1116,9 +1127,99 @@ detect_attention_pattern (function *fun, struct attn_candidate *cand)
       break;
     }
 
+  /* Fallback: 3-loop pattern — GCC at -O2 often fuses the matmul and
+     scale stages into a single outer loop.  Accept matmul1+scale fused,
+     softmax, matmul2.  */
+  if (!detected)
+    for (unsigned start = 0; start + 2 < top_loops.length (); start++)
+      {
+        class loop *l1 = top_loops[start];
+        class loop *l2 = top_loops[start + 1];
+        class loop *l3 = top_loops[start + 2];
+
+        if (dump_file)
+          fprintf (dump_file, "\n  Trying 3-loop window %d, %d, %d...\n",
+                   l1->num, l2->num, l3->num);
+
+        tree q_base, k_base, score_base_1;
+        if (!is_matmul_pattern (l1, &q_base, &k_base, &score_base_1))
+          { if (dump_file) fprintf (dump_file, "  3-loop: l1 not matmul\n"); continue; }
+
+        tree softmax_arr;
+        if (!is_softmax_pattern (l2, &softmax_arr))
+          { if (dump_file) fprintf (dump_file, "  3-loop: l2 not softmax\n"); continue; }
+        if (!arrays_share_base_lenient (score_base_1, softmax_arr))
+          { if (dump_file) fprintf (dump_file, "  3-loop: softmax array mismatch\n"); continue; }
+
+        tree matmul2_a, matmul2_b, matmul2_c;
+        if (!is_matmul_pattern (l3, &matmul2_a, &matmul2_b, &matmul2_c))
+          { if (dump_file) fprintf (dump_file, "  3-loop: l3 not matmul\n"); continue; }
+        if (!arrays_share_base_lenient (score_base_1, matmul2_a))
+          { if (dump_file) fprintf (dump_file, "  3-loop: matmul2 array mismatch\n"); continue; }
+
+        if (dump_file)
+          fprintf (dump_file,
+                   "\n  *** 3-LOOP ATTENTION PATTERN DETECTED ***\n"
+                   "  Loops: %d (matmul+scale fused) -> %d (softmax) -> %d (matmul2)\n",
+                   l1->num, l2->num, l3->num);
+
+        cand->matmul1_loop = l1;
+        cand->scale_loop   = NULL;
+        cand->softmax_loop = l2;
+        cand->matmul2_loop = l3;
+        cand->q_base       = q_base;
+        cand->k_base       = k_base;
+        cand->score_base   = score_base_1;
+        cand->v_base       = matmul2_b;
+        cand->output_base  = matmul2_c;
+        cand->scale_divisor = NULL_TREE;
+
+        tree niter_i = number_of_latch_executions (l1);
+        cand->seq_len = (niter_i && niter_i != chrec_dont_know)
+          ? fold_build2 (PLUS_EXPR, TREE_TYPE (niter_i), niter_i,
+                         build_one_cst (TREE_TYPE (niter_i)))
+          : NULL_TREE;
+
+        class loop *inner1 = get_innermost (l1);
+        tree niter_k = number_of_latch_executions (inner1);
+        cand->d_model = (niter_k && niter_k != chrec_dont_know)
+          ? fold_build2 (PLUS_EXPR, TREE_TYPE (niter_k), niter_k,
+                         build_one_cst (TREE_TYPE (niter_k)))
+          : NULL_TREE;
+
+        if (!cand->seq_len || !cand->d_model)
+          { if (dump_file) fprintf (dump_file, "  3-loop: trip counts unknown\n"); continue; }
+
+        edge e3 = loop_preheader_edge (l1);
+        cand->insert_bb = e3 ? e3->src : NULL;
+
+        edge exit_e3 = single_exit (l3);
+        if (exit_e3)
+          cand->exit_bb = exit_e3->dest;
+        else
+          {
+            cand->exit_bb = NULL;
+            basic_block *l3b = get_loop_body (l3);
+            for (unsigned bi = 0; bi < l3->num_nodes && !cand->exit_bb; bi++)
+              {
+                edge ex; edge_iterator exi;
+                FOR_EACH_EDGE (ex, exi, l3b[bi]->succs)
+                  if (!flow_bb_inside_loop_p (l3, ex->dest))
+                    { cand->exit_bb = ex->dest; break; }
+              }
+            free (l3b);
+          }
+
+        detected = true;
+        break;
+      }
+
+
 cleanup:
-  scev_finalize ();
-  loop_optimizer_finalize ();
+  if (local_scev_init)
+    scev_finalize ();
+  if (local_loop_init)
+    loop_optimizer_finalize ();
   return detected;
 }
 
@@ -1214,287 +1315,85 @@ build_qkv_struct (function *fun)
 static void
 replace_attention_with_builtin (function *fun, struct attn_candidate *cand)
 {
-  /* We emit the attn instruction as inline assembly (.insn directive)
-     rather than going through __builtin_riscv_attn, so we don't need
-     to look up the builtin declaration here.  */
-
-  /* Extract dimensions and pointers from the candidate struct, which
-     were populated during detection from loop trip counts and memory
-     access patterns.  This allows the pass to work in ANY function,
-     not just one with a specific parameter signature.
-
-     Fallback: if any candidate field is NULL (detection could not
-     extract it), try DECL_ARGUMENTS for backward compatibility with
-     the expected signature: attention(int n, int d, float *Q, float *K,
-                                        float *V, float *out).  */
-  tree p_n = cand->seq_len;
-  tree p_d = cand->d_model;
-  tree p_Q = cand->q_base;
-  tree p_K = cand->k_base;
-  tree p_V = cand->v_base;
-  tree p_out = cand->output_base;
-
-  /* Fallback to DECL_ARGUMENTS if any field is missing  */
-  if (!p_n || !p_d || !p_Q || !p_K || !p_V || !p_out)
+  /* Use the loop preheader edge — always exists at -O2 and avoids
+     having to search for the edge from orig_bb to loop1_header.  */
+  edge loop_entry_edge = loop_preheader_edge (cand->matmul1_loop);
+  if (!loop_entry_edge)
     {
       if (dump_file)
-        fprintf (dump_file, "  Candidate fields incomplete (n=%p d=%p Q=%p K=%p V=%p out=%p),"
-                 " falling back to DECL_ARGUMENTS\n",
-                 (void *)p_n, (void *)p_d, (void *)p_Q, (void *)p_K,
-                 (void *)p_V, (void *)p_out);
-      tree parm = DECL_ARGUMENTS (fun->decl);
-      if (parm && DECL_CHAIN (parm)
-          && DECL_CHAIN (DECL_CHAIN (parm))
-          && DECL_CHAIN (DECL_CHAIN (DECL_CHAIN (parm)))
-          && DECL_CHAIN (DECL_CHAIN (DECL_CHAIN (DECL_CHAIN (parm))))
-          && DECL_CHAIN (DECL_CHAIN (DECL_CHAIN (DECL_CHAIN (DECL_CHAIN (parm))))))
-        {
-          if (!p_n) { p_n = parm; }
-          parm = DECL_CHAIN (parm);
-          if (!p_d) { p_d = parm; }
-          parm = DECL_CHAIN (parm);
-          if (!p_Q) { p_Q = parm; }
-          parm = DECL_CHAIN (parm);
-          if (!p_K) { p_K = parm; }
-          parm = DECL_CHAIN (parm);
-          if (!p_V) { p_V = parm; }
-          parm = DECL_CHAIN (parm);
-          if (!p_out) { p_out = parm; }
-        }
-    }
-
-  if (!p_n || !p_d || !p_Q || !p_K || !p_V || !p_out)
-    {
-      if (dump_file)
-        fprintf (dump_file, "  ERROR: cannot extract function parameters\n");
+        fprintf (dump_file, "  ERROR: no preheader edge for matmul1 loop\n");
       return;
     }
 
-  /* We insert all code into a fresh basic block created by splitting the
-     edge from the preheader to the first loop's header.  This avoids
-     interfering with any terminating branch in the preheader block and
-     guarantees the new block has exactly one successor that we can
-     redirect to exit_bb.  */
+  /* Split the preheader->header edge to get a clean insertion block.  */
+  basic_block insert_bb = split_edge (loop_entry_edge);
 
-  basic_block orig_bb = cand->insert_bb;
-  if (!orig_bb)
-    orig_bb = single_succ (ENTRY_BLOCK_PTR_FOR_FN (fun));
+  /* Build memory clobber so the asm anchors the virtual-operand chain.
+     Without this, cleanup_tree_cfg leaves dangling vdef/vuse refs that
+     crash DCE and FRE.  */
+  vec<tree, va_gc> *clobbers = NULL;
+  tree mem_clob = build_tree_list (NULL_TREE, build_string (7, "memory"));
+  vec_safe_push (clobbers, mem_clob);
 
-  basic_block loop1_header = cand->matmul1_loop->header;
-
-  /* Find the edge from the preheader to loop1's header and split it.  */
-  edge loop_entry_edge = find_edge (orig_bb, loop1_header);
-  if (!loop_entry_edge)
-    {
-      /* Fallback: walk successors  */
-      edge tmp_e;
-      edge_iterator tmp_ei;
-      FOR_EACH_EDGE (tmp_e, tmp_ei, orig_bb->succs)
-        {
-          if (tmp_e->dest == loop1_header)
-            {
-              loop_entry_edge = tmp_e;
-              break;
-            }
-        }
-    }
-
-  basic_block insert_bb;
-  if (loop_entry_edge)
-    {
-      insert_bb = split_edge (loop_entry_edge);
-      if (dump_file)
-        fprintf (dump_file, "  Split edge bb %d -> bb %d, new bb %d\n",
-                 orig_bb->index, loop1_header->index, insert_bb->index);
-    }
-  else
-    {
-      /* Last resort: use orig_bb directly  */
-      insert_bb = orig_bb;
-      if (dump_file)
-        fprintf (dump_file, "  WARNING: could not find edge to split, "
-                 "using bb %d directly\n", insert_bb->index);
-    }
+  /* Emit the attn R-type instruction.
+     Encoding: opcode=0x0b, funct3=0, funct7=0x01, rd=x0 => 0x0200000b  */
+  gasm *attn_asm = gimple_build_asm_vec (
+    ".word 0x0200000b",
+    NULL,      /* inputs   */
+    NULL,      /* outputs  */
+    clobbers,  /* clobbers */
+    NULL);     /* labels   */
+  gimple_asm_set_volatile (attn_asm, true);
 
   gimple_stmt_iterator gsi = gsi_start_bb (insert_bb);
+  gsi_insert_before (&gsi, attn_asm, GSI_SAME_STMT);
 
-  /* 1. Build dims struct {n, n, n, d} on stack  */
-  tree dims_var = build_dims_struct (fun);
-  tree dims_type = TREE_TYPE (dims_var);
-  tree f = TYPE_FIELDS (dims_type);
+  /* Register virtual operands for the new asm stmt so update_ssa
+     knows about the VDEF it produces.  */
+  update_stmt (attn_asm);
 
-  tree n_int = fold_convert (integer_type_node, p_n);
-  tree d_int = fold_convert (integer_type_node, p_d);
-
-  /* rows  */
-  gimple *s1 = gimple_build_assign (
-    build3 (COMPONENT_REF, integer_type_node, dims_var, f, NULL_TREE),
-    n_int);
-  gsi_insert_after (&gsi, s1, GSI_NEW_STMT);
-
-  /* cols  */
-  f = DECL_CHAIN (f);
-  gimple *s2 = gimple_build_assign (
-    build3 (COMPONENT_REF, integer_type_node, dims_var, f, NULL_TREE),
-    n_int);
-  gsi_insert_after (&gsi, s2, GSI_NEW_STMT);
-
-  /* seq_len  */
-  f = DECL_CHAIN (f);
-  gimple *s3 = gimple_build_assign (
-    build3 (COMPONENT_REF, integer_type_node, dims_var, f, NULL_TREE),
-    n_int);
-  gsi_insert_after (&gsi, s3, GSI_NEW_STMT);
-
-  /* d_model  */
-  f = DECL_CHAIN (f);
-  gimple *s4 = gimple_build_assign (
-    build3 (COMPONENT_REF, integer_type_node, dims_var, f, NULL_TREE),
-    d_int);
-  gsi_insert_after (&gsi, s4, GSI_NEW_STMT);
-
-  /* 2. Build qkv struct {Q, K, V} on stack  */
-  tree qkv_var = build_qkv_struct (fun);
-  tree qkv_type = TREE_TYPE (qkv_var);
-  tree fq = TYPE_FIELDS (qkv_type);
-  tree ptr_type = build_pointer_type (float_type_node);
-
-  gimple *sq = gimple_build_assign (
-    build3 (COMPONENT_REF, ptr_type, qkv_var, fq, NULL_TREE),
-    fold_convert (ptr_type, p_Q));
-  gsi_insert_after (&gsi, sq, GSI_NEW_STMT);
-
-  fq = DECL_CHAIN (fq);
-  gimple *sk = gimple_build_assign (
-    build3 (COMPONENT_REF, ptr_type, qkv_var, fq, NULL_TREE),
-    fold_convert (ptr_type, p_K));
-  gsi_insert_after (&gsi, sk, GSI_NEW_STMT);
-
-  fq = DECL_CHAIN (fq);
-  gimple *sv = gimple_build_assign (
-    build3 (COMPONENT_REF, ptr_type, qkv_var, fq, NULL_TREE),
-    fold_convert (ptr_type, p_V));
-  gsi_insert_after (&gsi, sv, GSI_NEW_STMT);
-
-  fq = DECL_CHAIN (fq);
-  gimple *so = gimple_build_assign (
-    build3 (COMPONENT_REF, ptr_type, qkv_var, fq, NULL_TREE),
-    fold_convert (ptr_type, p_out));
-  gsi_insert_after (&gsi, so, GSI_NEW_STMT);
-
-  /* 3. Volatile barrier  */
-  gasm *barrier = gimple_build_asm_vec ("", NULL, NULL, NULL, NULL);
-  gimple_asm_set_volatile (barrier, true);
-  gsi_insert_after (&gsi, barrier, GSI_NEW_STMT);
-
-  /* 4. Call __builtin_riscv_attn((ulong)&dims, (ulong)&qkv)  */
-  tree ul_type = long_unsigned_type_node;
-
-  tree dims_addr_expr = build_fold_addr_expr (dims_var);
-  tree dims_cast = fold_convert (ul_type, dims_addr_expr);
-  tree dims_tmp = create_tmp_var (ul_type, "dims_addr");
-  gimple *gc1 = gimple_build_assign (dims_tmp, dims_cast);
-  gsi_insert_after (&gsi, gc1, GSI_NEW_STMT);
-
-  /* &qkv → (unsigned long)  */
-  tree qkv_addr_expr = build_fold_addr_expr (qkv_var);
-  tree qkv_cast = fold_convert (ul_type, qkv_addr_expr);
-  tree qkv_tmp = create_tmp_var (ul_type, "qkv_addr");
-  gimple *gc2 = gimple_build_assign (qkv_tmp, qkv_cast);
-  gsi_insert_after (&gsi, gc2, GSI_NEW_STMT);
-
-  /* The actual call — emit as inline assembly to guarantee the
-     instruction survives all optimization passes.  The .insn directive
-     encodes the R-type attn instruction directly.
-
-     Encoding: .insn r 0x0b, 0, 0x01, x0, rs1, rs2
-       opcode=0x0b (custom-0), funct3=0, funct7=0x01
-       rd=x0 (unused), rs1=dims_addr, rs2=qkv_addr              */
-
-  tree ul_type_2 = long_unsigned_type_node;
-
-  /* Build: asm volatile (".insn r 0x0b, 0, 0x01, x0, %0, %1"
-                           : : "r"(dims_addr), "r"(qkv_addr) : "memory"); */
-
-  /* Input constraints: "r" for both operands  */
-  tree constraint_r = build_string (1, "r");
-
-  vec<tree, va_gc> *inputs = NULL;
-  /* First input: dims_addr  */
-  tree in1 = build_tree_list (
-    build_tree_list (NULL_TREE, constraint_r), dims_tmp);
-  vec_safe_push (inputs, in1);
-  /* Second input: qkv_addr  */
-  tree in2 = build_tree_list (
-    build_tree_list (NULL_TREE, constraint_r), qkv_tmp);
-  vec_safe_push (inputs, in2);
-
-  /* Clobbers: "memory"  */
-  vec<tree, va_gc> *clobbers = NULL;
-  tree mem_clobber = build_tree_list (NULL_TREE, build_string (6, "memory"));
-  vec_safe_push (clobbers, mem_clobber);
-
-  gasm *attn_asm = gimple_build_asm_vec (
-    ".insn r 0x0b, 0, 0x01, x0, %0, %1",
-    inputs,          /* inputs  */
-    NULL,            /* outputs  */
-    clobbers,        /* clobbers  */
-    NULL);           /* labels  */
-  gimple_asm_set_volatile (attn_asm, true);
-  gsi_insert_after (&gsi, attn_asm, GSI_NEW_STMT);
-
-  if (dump_file)
-    {
-      fprintf (dump_file, "\n  Inserted attn instruction via inline asm:\n  ");
-      print_gimple_stmt (dump_file, attn_asm, 0, TDF_SLIM);
-      fprintf (dump_file, "\n");
-    }
-
-  /* 5. Redirect control flow: skip all 4 loops.
-
-     The split block (insert_bb) currently has exactly one successor —
-     the first loop's header.  Redirect that edge to the exit block
-     of the fourth loop, making all loop bodies unreachable.
-     Later DCE passes clean up the dead code.  */
-
+  /* Redirect insert_bb to exit_bb, making all loop BBs unreachable.
+     cleanup_tree_cfg (via TODO_cleanup_cfg) will remove them.  */
   if (cand->exit_bb)
     {
-      if (dump_file)
-        fprintf (dump_file, "  Redirect: insert_bb=%d has %d succs, "
-                 "exit_bb=%d\n", insert_bb->index,
-                 EDGE_COUNT (insert_bb->succs), cand->exit_bb->index);
-
-      /* Redirect ALL outgoing edges from insert_bb to exit_bb.  */
-      bool redirected = false;
       edge e;
       edge_iterator ei;
       FOR_EACH_EDGE (e, ei, insert_bb->succs)
         {
-          if (dump_file)
-            fprintf (dump_file, "    Redirecting bb %d -> bb %d to bb %d\n",
-                     insert_bb->index, e->dest->index, cand->exit_bb->index);
           redirect_edge_and_branch (e, cand->exit_bb);
-          redirected = true;
-          break;  /* Iterator invalidated after redirect, exit loop  */
+          if (dump_file)
+            fprintf (dump_file,
+                     "  CFG redirect: insert_bb=%d -> exit_bb=%d\n",
+                     insert_bb->index, cand->exit_bb->index);
+          break;
         }
+    }
+  else if (dump_file)
+    fprintf (dump_file, "  WARNING: exit_bb NULL, CFG not redirected\n");
 
-      if (!redirected && dump_file)
-        fprintf (dump_file, "  WARNING: no edges to redirect!\n");
-    }
-  else
-    {
-      if (dump_file)
-        fprintf (dump_file, "  WARNING: exit_bb is NULL, skipping redirect\n");
-    }
+  /* Tell GCC the loop-closed SSA form is gone (loops are dead) so
+     repair_loop_structures does not try to rewrite it.  */
+  loops_state_clear (LOOP_CLOSED_SSA);
+
+  /* Force virtual-operand renaming: after cleanup_tree_cfg removes the
+     dead loop BBs, update_ssa must recompute the vdef/vuse chain so
+     that the exit block's VUSE reaches the asm's VDEF, not a
+     now-deleted loop stmt.  */
+  mark_virtual_operands_for_renaming (cfun);
+
+  free_dominance_info (CDI_DOMINATORS);
+  free_dominance_info (CDI_POST_DOMINATORS);
 
   if (dump_file)
-    fprintf (dump_file, "  Attention pattern replaced successfully.\n\n");
+    fprintf (dump_file,
+             "  Inserted .word 0x0200000b + bypassed all loops.\n"
+             "  Attention pattern replaced successfully.\n\n");
 }
 
 
-/* ═══════════════════════════════════════════════════════════════════
+/* ===================================================================
  *  SECTION F: Pass class definition
- * ═══════════════════════════════════════════════════════════════════ */
+ * =================================================================== */
 
 namespace {
 
@@ -1507,8 +1406,7 @@ const pass_data pass_data_riscv_attn_detect = {
   0,                              /* properties_provided  */
   0,                              /* properties_destroyed  */
   0,                              /* todo_flags_start  */
-  (TODO_update_ssa
-   | TODO_cleanup_cfg),           /* todo_flags_finish  */
+  0,                         /* todo_flags_finish  */
 };
 
 
@@ -1540,7 +1438,7 @@ public:
                    "replacing with __builtin_riscv_attn\n\n",
                    function_name (fun));
 
-        replace_attention_with_builtin (fun, &cand);
+       replace_attention_with_builtin (fun, &cand);
 
         return TODO_cleanup_cfg | TODO_update_ssa;
       }

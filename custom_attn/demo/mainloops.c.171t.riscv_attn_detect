@@ -1,0 +1,382 @@
+
+;; Function attention (attention, funcdef_no=0, decl_uid=2329, cgraph_uid=1, symbol_order=0)
+
+
+=== Attention pattern detection in attention ===
+  Found 4 top-level loop(s)
+
+  Trying loops 1, 2, 3, 4...
+    find_matmul: scanning 2 bbs in innermost loop 11
+    assign code=73 (PLUS=73 MULT=75)
+    assign code=129 (PLUS=73 MULT=75)
+    assign code=75 (PLUS=73 MULT=75)
+    assign code=76 (PLUS=73 MULT=75)
+    assign code=167 (PLUS=73 MULT=75)
+    assign code=73 (PLUS=73 MULT=75)
+    ** PLUS+MULT matched! extracting refs...
+    op_a: is_assign=0
+    op_b: is_assign=0
+    ref_a=NULL ref_b=NULL
+    assign code=129 (PLUS=73 MULT=75)
+    assign code=75 (PLUS=73 MULT=75)
+    assign code=76 (PLUS=73 MULT=75)
+    assign code=167 (PLUS=73 MULT=75)
+    assign code=75 (PLUS=73 MULT=75)
+    assign code=73 (PLUS=73 MULT=75)
+    ** PLUS+MULT matched! extracting refs...
+    op_a: is_assign=1 rhs_code=167 (MEM_REF=167)
+    op_b: is_assign=1 rhs_code=167 (MEM_REF=167)
+    ref_a=OK ref_b=OK
+  Found matmul pattern in loop 1 (store_base=found)
+  Found elementwise-div pattern in loop 2
+  Base check: score=var_decl(2331) scale=var_decl(2331)
+  Found softmax pattern in loop 3 (3 children: max, exp-sum, normalize)
+    find_matmul: scanning 2 bbs in innermost loop 6
+    assign code=73 (PLUS=73 MULT=75)
+    ** PLUS+MULT matched! extracting refs...
+    op_a: is_assign=0
+    op_b: is_assign=0
+    ref_a=NULL ref_b=NULL
+    assign code=51 (PLUS=73 MULT=75)
+    assign code=75 (PLUS=73 MULT=75)
+    assign code=73 (PLUS=73 MULT=75)
+    ** PLUS+MULT matched! extracting refs...
+    op_a: is_assign=0
+    op_b: is_assign=0
+    ref_a=NULL ref_b=NULL
+    assign code=129 (PLUS=73 MULT=75)
+    assign code=75 (PLUS=73 MULT=75)
+    assign code=76 (PLUS=73 MULT=75)
+    assign code=167 (PLUS=73 MULT=75)
+    assign code=75 (PLUS=73 MULT=75)
+    assign code=73 (PLUS=73 MULT=75)
+    ** PLUS+MULT matched! extracting refs...
+    op_a: is_assign=1 rhs_code=51 (MEM_REF=167)
+    op_b: is_assign=1 rhs_code=167 (MEM_REF=167)
+    ref_a=OK ref_b=OK
+  Found matmul pattern in loop 4 (store_base=found)
+
+  *** ATTENTION PATTERN DETECTED ***
+  Loops: 1 (matmul1) → 2 (scale) → 3 (softmax) → 4 (matmul2)
+
+>>> Attention pattern detected in 'attention' — replacing with __builtin_riscv_attn
+
+void attention (int n, int d, float * Q, float * K, float * V, float * out)
+{
+  _Bool DCE_COND_LB_TEST.3;
+  float DCE_COND_LB.2;
+  float sum;
+  float row_sum;
+  float sum;
+  int k;
+  int j;
+  int i;
+  float scale;
+  float scores[4096];
+  float _1;
+  float _2;
+  int _3;
+  int _4;
+  long unsigned int _5;
+  long unsigned int _6;
+  float * _7;
+  float _8;
+  int _9;
+  int _10;
+  long unsigned int _11;
+  long unsigned int _12;
+  float * _13;
+  float _14;
+  float _15;
+  int _16;
+  int _17;
+  int _18;
+  int _19;
+  float _20;
+  float _21;
+  int _22;
+  int _23;
+  float _24;
+  float _25;
+  int _27;
+  float _28;
+  float _29;
+  int _30;
+  int _31;
+  float _32;
+  int _33;
+  int _34;
+  long unsigned int _35;
+  long unsigned int _36;
+  float * _37;
+  float _38;
+  float _39;
+  int _40;
+  int _41;
+  long unsigned int _42;
+  long unsigned int _43;
+  float * _44;
+  float _99;
+  float _107;
+  unsigned int _114;
+  unsigned int _148;
+  unsigned int _171;
+
+  <bb 2> [local count: 1804255]:
+  _1 = (float) d_68(D);
+  if (_1 u>= 0.0)
+    goto <bb 3>; [99.95%]
+  else
+    goto <bb 4>; [0.05%]
+
+  <bb 3> [local count: 1803353]:
+  _2 = .SQRT (_1);
+  goto <bb 5>; [100.00%]
+
+  <bb 4> [local count: 902]:
+  _99 = __builtin_sqrtf (_1);
+
+  <bb 5> [local count: 1804255]:
+  # _107 = PHI <_99(4), _2(3)>
+  if (n_72(D) > 0)
+    goto <bb 11>; [89.00%]
+  else
+    goto <bb 42>; [11.00%]
+
+  <bb 6> [local count: 105119324]:
+  _9 = d_68(D) * j_129;
+
+  <bb 7> [local count: 955630225]:
+  # k_134 = PHI <k_97(41), 0(6)>
+  # sum_136 = PHI <sum_96(41), 0.0(6)>
+  _4 = _3 + k_134;
+  _5 = (long unsigned int) _4;
+  _6 = _5 * 4;
+  _7 = Q_94(D) + _6;
+  _8 = *_7;
+  _10 = _9 + k_134;
+  _11 = (long unsigned int) _10;
+  _12 = _11 * 4;
+  _13 = K_95(D) + _12;
+  _14 = *_13;
+  _15 = _8 * _14;
+  sum_96 = _15 + sum_136;
+  k_97 = k_134 + 1;
+  if (d_68(D) > k_97)
+    goto <bb 41>; [89.00%]
+  else
+    goto <bb 43>; [11.00%]
+
+  <bb 41> [local count: 850510901]:
+  goto <bb 7>; [100.00%]
+
+  <bb 43> [local count: 105119324]:
+  # sum_161 = PHI <sum_96(7)>
+
+  <bb 8> [local count: 118111600]:
+  # sum_137 = PHI <sum_161(43), 0.0(44)>
+  _17 = _16 + j_129;
+  scores[_17] = sum_137;
+  j_93 = j_129 + 1;
+  if (n_72(D) > j_93)
+    goto <bb 40>; [87.64%]
+  else
+    goto <bb 10>; [12.36%]
+
+  <bb 40> [local count: 103513537]:
+
+  <bb 9> [local count: 118111600]:
+  # j_129 = PHI <j_93(40), 0(12)>
+  if (d_68(D) > 0)
+    goto <bb 6>; [89.00%]
+  else
+    goto <bb 44>; [11.00%]
+
+  <bb 44> [local count: 12992276]:
+  goto <bb 8>; [100.00%]
+
+  <bb 10> [local count: 14598063]:
+  i_91 = i_125 + 1;
+  if (n_72(D) > i_91)
+    goto <bb 39>; [89.00%]
+  else
+    goto <bb 30>; [11.00%]
+
+  <bb 39> [local count: 12992276]:
+  goto <bb 12>; [100.00%]
+
+  <bb 30> [local count: 1605787]:
+  goto <bb 15>; [100.00%]
+
+  <bb 11> [local count: 1605787]:
+  scale_71 = 1.0e+0 / _107;
+  _171 = (unsigned int) d_68(D);
+
+  <bb 12> [local count: 14598063]:
+  # i_125 = PHI <i_91(39), 0(11)>
+  _114 = (unsigned int) i_125;
+  _148 = _114 * _171;
+  _3 = (int) _148;
+  _16 = n_72(D) * i_125;
+  goto <bb 9>; [100.00%]
+
+  <bb 38> [local count: 103513537]:
+
+  <bb 13> [local count: 118111600]:
+  # j_130 = PHI <j_90(38), 0(15)>
+  _19 = _18 + j_130;
+  _20 = scores[_19];
+  _21 = _20 * scale_71;
+  scores[_19] = _21;
+  j_90 = j_130 + 1;
+  if (n_72(D) > j_90)
+    goto <bb 38>; [87.64%]
+  else
+    goto <bb 14>; [12.36%]
+
+  <bb 14> [local count: 14598063]:
+  i_88 = i_126 + 1;
+  if (n_72(D) > i_88)
+    goto <bb 37>; [89.00%]
+  else
+    goto <bb 28>; [11.00%]
+
+  <bb 37> [local count: 12992276]:
+
+  <bb 15> [local count: 14598063]:
+  # i_126 = PHI <i_88(37), 0(30)>
+  _18 = n_72(D) * i_126;
+  goto <bb 13>; [100.00%]
+
+  <bb 36> [local count: 103513537]:
+
+  <bb 16> [local count: 118111600]:
+  # j_131 = PHI <j_87(36), 0(19)>
+  # row_sum_138 = PHI <row_sum_86(36), 0.0(19)>
+  _23 = _22 + j_131;
+  _24 = scores[_23];
+  _25 = __builtin_expf (_24);
+  scores[_23] = _25;
+  row_sum_86 = _25 + row_sum_138;
+  j_87 = j_131 + 1;
+  if (n_72(D) > j_87)
+    goto <bb 36>; [87.64%]
+  else
+    goto <bb 29>; [12.36%]
+
+  <bb 29> [local count: 14598063]:
+  # row_sum_168 = PHI <row_sum_86(16)>
+
+  <bb 17> [local count: 118111600]:
+  # j_132 = PHI <j_83(35), 0(29)>
+  _27 = _22 + j_132;
+  _28 = scores[_27];
+  _29 = _28 / row_sum_168;
+  scores[_27] = _29;
+  j_83 = j_132 + 1;
+  if (n_72(D) > j_83)
+    goto <bb 35>; [87.64%]
+  else
+    goto <bb 18>; [12.36%]
+
+  <bb 35> [local count: 103513537]:
+  goto <bb 17>; [100.00%]
+
+  <bb 18> [local count: 14598063]:
+  i_81 = i_127 + 1;
+  if (n_72(D) > i_81)
+    goto <bb 34>; [89.00%]
+  else
+    goto <bb 27>; [11.00%]
+
+  <bb 34> [local count: 12992276]:
+  goto <bb 19>; [100.00%]
+
+  <bb 27> [local count: 1605787]:
+  goto <bb 25>; [100.00%]
+
+  <bb 28> [local count: 1605787]:
+
+  <bb 19> [local count: 14598063]:
+  # i_127 = PHI <i_81(34), 0(28)>
+  _22 = n_72(D) * i_127;
+  goto <bb 16>; [100.00%]
+
+  <bb 42> [local count: 198468]:
+
+  <bb 20> [local count: 1804255]:
+  scores ={v} {CLOBBER(eos)};
+  return;
+
+  <bb 33> [local count: 837518624]:
+
+  <bb 21> [local count: 955630225]:
+  # k_135 = PHI <k_80(33), 0(23)>
+  # sum_140 = PHI <sum_79(33), 0.0(23)>
+  _31 = _30 + k_135;
+  _32 = scores[_31];
+  _33 = d_68(D) * k_135;
+  _34 = _33 + j_133;
+  _35 = (long unsigned int) _34;
+  _36 = _35 * 4;
+  _37 = V_78(D) + _36;
+  _38 = *_37;
+  _39 = _32 * _38;
+  sum_79 = _39 + sum_140;
+  k_80 = k_135 + 1;
+  if (n_72(D) > k_80)
+    goto <bb 33>; [87.64%]
+  else
+    goto <bb 22>; [12.36%]
+
+  <bb 22> [local count: 118111600]:
+  # sum_170 = PHI <sum_79(21)>
+  _41 = _40 + j_133;
+  _42 = (long unsigned int) _41;
+  _43 = _42 * 4;
+  _44 = out_75(D) + _43;
+  *_44 = sum_170;
+  j_77 = j_133 + 1;
+  if (d_68(D) > j_77)
+    goto <bb 32>; [89.00%]
+  else
+    goto <bb 45>; [11.00%]
+
+  <bb 32> [local count: 105119324]:
+
+  <bb 23> [local count: 118111600]:
+  # j_133 = PHI <j_77(32), 0(26)>
+  goto <bb 21>; [100.00%]
+
+  <bb 45> [local count: 12992276]:
+
+  <bb 24> [local count: 14598063]:
+  i_74 = i_128 + 1;
+  if (n_72(D) > i_74)
+    goto <bb 31>; [89.00%]
+  else
+    goto <bb 46>; [11.00%]
+
+  <bb 46> [local count: 1605787]:
+  goto <bb 20>; [100.00%]
+
+  <bb 31> [local count: 12992276]:
+
+  <bb 25> [local count: 14598063]:
+  # i_128 = PHI <i_74(31), 0(27)>
+  if (d_68(D) > 0)
+    goto <bb 26>; [89.00%]
+  else
+    goto <bb 47>; [11.00%]
+
+  <bb 47> [local count: 1605787]:
+  goto <bb 24>; [100.00%]
+
+  <bb 26> [local count: 12992276]:
+  _30 = n_72(D) * i_128;
+  _40 = d_68(D) * i_128;
+  goto <bb 23>; [100.00%]
+
+}
+
+

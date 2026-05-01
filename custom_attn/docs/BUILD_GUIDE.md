@@ -275,10 +275,12 @@ grep -i "attention pattern" attention.c.*riscv_attn_detect*
 | `RISCV_ATYPE_DI` undeclared | Wrong type in `riscv-ftypes.def` | Issue 3 — change `DI` to `UDI` |
 | ICE in `scev_initialize` | Unconditional loop init | Issue 4 — add `local_loop_init` guard |
 | ICE in `repair_loop_structures` | `TODO_cleanup_cfg` in finish flags | Issue 5 — remove `TODO_cleanup_cfg` |
-| ICE in `bitmap_set_bit` | CFG corruption after BB removal | Issue 6 — replacement disabled |
+| ICE in `bitmap_set_bit` | CFG corruption after BB removal | Issue 6 — **resolved**; see `KNOWN_ISSUES.md` |
 | Pass ICE outside loop context | Wrong placement in `passes.def` | Issue 7 — place after `pass_loop_distribution` |
 | Duplicate `-o` flag link error | Wrong `t-riscv` recipe | Issue 8 — use `$(COMPILE) $<` only |
 | Pass linked but not called | Missing `extra_objs` entry | Issue 9 — add to `config.gcc` |
+| ICE in `calc_dfs_tree` | Stale dominance info after edge redirect | Issue 10 — fixed; see `KNOWN_ISSUES.md` |
+| DCE crash `bb==NULL` | Broken virtual operand chain after BB removal | Issue 11 — fixed; see `KNOWN_ISSUES.md` |
 
 ---
 

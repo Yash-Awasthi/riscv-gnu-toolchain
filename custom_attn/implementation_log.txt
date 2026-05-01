@@ -118,12 +118,8 @@ phase and performs the following:
 ═══════════════════════════════════════════════════════════════
 
 When all 4 stages are detected in sequence:
-  Note: The steps below describe the full hardware contract. The current
-  implementation uses a simplified approach: it emits `.word 0x0200000b`
-  as a volatile inline asm (with "memory" clobber) and redirects CFG directly
-  to the exit block. No dims/qkv structs are built in the current source.
-  The struct-passing convention below is preserved as the intended interface
-  for a full hardware implementation.
+  The replacement function (riscv-attn-detect.cc) implements the full
+  struct-passing calling convention described below.
 
 
 1. Extract function parameters via DECL_ARGUMENTS:
@@ -312,10 +308,12 @@ FIX 11: DCE crash in mark_operand_necessary (bb == NULL)
   SSA names defined in deleted loop BBs had NULL basic block pointers.
   DCE crashed dereferencing them. Virtual operand chain was also broken.
   Fix (three parts):
-    a) Add "memory" clobber to the asm — creates VDEF anchoring the vop chain.
-    b) Call mark_virtual_operands_for_renaming(cfun) — rethreads VUSEs to the
+    a) Use flat arrays (ARRAY_REF + TREE_ADDRESSABLE) instead of COMPONENT_REF
+       on dynamically-built struct types — avoids FRE's eliminate_stmt crash.
+    b) Add "memory" clobber to the asm — creates VDEF anchoring the vop chain.
+    c) Call mark_virtual_operands_for_renaming(cfun) — rethreads VUSEs to the
        new VDEF instead of deleted BBs.
-    c) Return TODO_cleanup_cfg | TODO_update_ssa from execute() — cleanup
+    d) Return TODO_cleanup_cfg | TODO_update_ssa from execute() — cleanup
        removes dead BBs first; then update_ssa sees a consistent CFG.
        (Moving TODO_cleanup_cfg out of todo_flags_finish is essential —
         in finish flags it ran after SSA had already processed stale BBs.)

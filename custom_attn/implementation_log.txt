@@ -88,6 +88,10 @@ phase and performs the following:
 1. Collects top-level loops from the function's loop tree
 2. Reverses loop order (GCC lists children in reverse program order)
 3. Slides a window of 4 consecutive loops, checking:
+  Note: At -O2, GCC fuses the scale operation into the matmul loop. In practice
+  the pass detects 3 top-level loops (matmul+scale fused, softmax, matmul2).
+  The Stage 2 detector (is_elementwise_div) handles the unfused case.
+
 
   Stage 1: is_matmul_pattern()
     — Triple-nested loop (i, j, k)
@@ -114,6 +118,13 @@ phase and performs the following:
 ═══════════════════════════════════════════════════════════════
 
 When all 4 stages are detected in sequence:
+  Note: The steps below describe the full hardware contract. The current
+  implementation uses a simplified approach: it emits `.word 0x0200000b`
+  as a volatile inline asm (with "memory" clobber) and redirects CFG directly
+  to the exit block. No dims/qkv structs are built in the current source.
+  The struct-passing convention below is preserved as the intended interface
+  for a full hardware implementation.
+
 
 1. Extract function parameters via DECL_ARGUMENTS:
    — n (int), d (int), Q (float*), K (float*), V (float*)
@@ -287,6 +298,29 @@ Test 3: GIMPLE pass dump verification
 
 
 ═══════════════════════════════════════════════════════════════
+  FIXES APPLIED — CFG Replacement Correctness
+═══════════════════════════════════════════════════════════════
+
+FIX 10: ICE in calc_dfs_tree (stale dominance info)
+  After redirect_edge_and_branch() the loop BBs were unreachable but still
+  present in the CFG. update_ssa's DFS traversal crashed.
+  Fix: call free_dominance_info(CDI_DOMINATORS) and
+       free_dominance_info(CDI_POST_DOMINATORS) before returning.
+  Forces update_ssa to recompute the dominator tree from scratch.
+
+FIX 11: DCE crash in mark_operand_necessary (bb == NULL)
+  SSA names defined in deleted loop BBs had NULL basic block pointers.
+  DCE crashed dereferencing them. Virtual operand chain was also broken.
+  Fix (three parts):
+    a) Add "memory" clobber to the asm — creates VDEF anchoring the vop chain.
+    b) Call mark_virtual_operands_for_renaming(cfun) — rethreads VUSEs to the
+       new VDEF instead of deleted BBs.
+    c) Return TODO_cleanup_cfg | TODO_update_ssa from execute() — cleanup
+       removes dead BBs first; then update_ssa sees a consistent CFG.
+       (Moving TODO_cleanup_cfg out of todo_flags_finish is essential —
+        in finish flags it ran after SSA had already processed stale BBs.)
+
+═══════════════════════════════════════════════════════════════
   SUMMARY
 ═══════════════════════════════════════════════════════════════
 
@@ -302,9 +336,10 @@ Two paths to the attn instruction:
     → -O2 optimization level required for the pass to run.
     → Output: attn zero,a5,a4
 
-Total fixes applied: 11
+Total fixes applied: 13
   — 7 for initial GCC 15.2.0 integration
-  — 4 for GIMPLE pass replacement correctness
+  — 4 for GIMPLE pass detection correctness
+  — 2 for GIMPLE pass replacement CFG+SSA correctness (Fixes 10–11)
     (builtin lookup, control flow, exit block, DCE immunity)
 
 Files modified: 10 total
